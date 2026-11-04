@@ -10,7 +10,7 @@
 # Optional Variables (passed through when set):
 #   LLM_MAX_OUTPUT_TOKENS, LLM_THINKING, LLM_REQUEST_TIMEOUT_MS
 
-name: reviewbrief
+name: FixBrief AI
 
 on:
   pull_request:

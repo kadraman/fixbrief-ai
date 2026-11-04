@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { annotateDiff, parseDiffLines } from "./difflines.ts";
-import { changedSymbols, contextOptionsFromEnv, createContextBuilder, readProjectGuidance, summarizeDiff, usageSection } from "./context.ts";
-import type { ContextOptions } from "./context.ts";
+import { annotateDiff, parseDiffLines } from "../src/difflines.ts";
+import { changedSymbols, contextOptionsFromEnv, createContextBuilder, readProjectGuidance, summarizeDiff, usageSection } from "../src/context.ts";
+import type { ContextOptions } from "../src/context.ts";
 
 const DIFF = [
   "diff --git a/src/api.ts b/src/api.ts", "index 111..222 100644", "--- a/src/api.ts", "+++ b/src/api.ts",

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** ReviewBrief pipeline. Requires Node.js 22.6 or newer. */
+/** FixBrief AI pipeline. Requires Node.js 22.6 or newer. */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -71,7 +71,7 @@ async function chat(provider: string, model: string, key: string, baseUrl: strin
   const headers: Record<string, string> = anthropic
     ? { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" }
     : { "content-type": "application/json", authorization: `Bearer ${key}` };
-  headers["user-agent"] = `reviewbrief/${VERSION}`;
+  headers["user-agent"] = `fixbrief-ai/${VERSION}`;
   // GPT-5 / o-series Chat Completions expect max_completion_tokens; older OpenAI-compatible APIs use max_tokens.
   const useMaxCompletionTokens = !anthropic && /^(gpt-5|o[0-9])/i.test(model);
   const body: Record<string, unknown> = anthropic
@@ -397,7 +397,7 @@ function printPlan(
 }
 function readArgs(argv: string[]) {
   const values: Record<string, string> = {
-    diff: "-", anchorDiff: env("ANCHOR_DIFF_FILE"), outDir: ".reviewbrief", title: env("PR_TITLE"), body: env("PR_BODY"),
+    diff: "-", anchorDiff: env("ANCHOR_DIFF_FILE"), outDir: ".fixbrief-ai", title: env("PR_TITLE"), body: env("PR_BODY"),
     pr: env("PR_NUMBER"), repo: env("REPO"), head: env("PR_HEAD"), base: env("PR_BASE"),
     minimumConfidence: env("MINIMUM_CONFIDENCE", "0.85"), maxInlineComments: env("MAX_INLINE_COMMENTS", "0"),
   };
@@ -413,7 +413,7 @@ function readArgs(argv: string[]) {
     if (arg === "--dry-run" || arg === "--no-fix-brief") { flags.add(arg); continue; }
     if (arg === "--version") { console.log(VERSION); process.exit(0); }
     if (arg === "--help" || arg === "-h") {
-      console.log("Usage: node scripts/reviewbrief.ts [--diff FILE] [--anchor-diff FILE] [--out-dir DIR] [--dry-run] [--no-fix-brief]\nConfiguration is read from environment variables.");
+      console.log("Usage: node src/fixbrief-ai.ts [--diff FILE] [--anchor-diff FILE] [--out-dir DIR] [--dry-run] [--no-fix-brief]\nConfiguration is read from environment variables.");
       process.exit(0);
     }
     const name = names[arg];
@@ -450,7 +450,7 @@ async function main(): Promise<number> {
   const { pieces, skipped } = splitDiff(diff, batchChars, pieceChars);
   if (!pieces.length) {
     const note = `No reviewable changes found.${skipped.length ? ` Skipped: ${skipped.join(", ")}` : ""}`;
-    writeFileSync(reviewPath, `## ReviewBrief\n\n${note}\n`);
+    writeFileSync(reviewPath, `## FixBrief AI\n\n${note}\n`);
     writeFileSync(join(args.outDir, "review-payload.json"), JSON.stringify(githubReviewPayload([]), null, 2));
     writeFileSync(join(args.outDir, "findings.json"), JSON.stringify({
       schemaVersion: 1, engineVersion: VERSION, repo: ctx.repo, pr: ctx.pr, findings: [], failedBatches: [], dropped: 0,
@@ -488,7 +488,7 @@ async function main(): Promise<number> {
   const outcomes = runOutcomes[0];
   const failed = outcomes.filter((o) => !o.ok);
   if (failed.length === outcomes.length) {
-    writeFileSync(reviewPath, `## ReviewBrief\n\n${outcomes.map((item) => item.text).join("\n\n")}\n`);
+    writeFileSync(reviewPath, `## FixBrief AI\n\n${outcomes.map((item) => item.text).join("\n\n")}\n`);
     console.error(`Every batch failed; nothing to report:\n${outcomes.map((item) => item.text).join("\n")}`);
     return 1;
   }
@@ -554,7 +554,7 @@ async function main(): Promise<number> {
   // Append the same footer to the gated PR payload so create-review shows scope/failures.
   payload.body = `${payload.body.trimEnd()}\n\n---\n${footer.join("\n\n")}\n`;
   writeFileSync(join(args.outDir, "review-payload.json"), JSON.stringify(payload, null, 2));
-  let output = `## ReviewBrief\n\n${final}\n\n---\n${footer.join("\n\n")}`;
+  let output = `## FixBrief AI\n\n${final}\n\n---\n${footer.join("\n\n")}`;
   const targetsPath = join(args.outDir, "fix-brief-targets.json");
   if (existsSync(targetsPath)) rmSync(targetsPath);
   if (env("FIX_BRIEF", "true").toLowerCase() === "true" && !flags.has("--no-fix-brief")) {

@@ -20,7 +20,7 @@ jobs:
           node-version: "22"
 
       - name: Verify engine loads
-        run: node --experimental-strip-types scripts/reviewbrief.ts --version
+        run: node --experimental-strip-types src/fixbrief-ai.ts --version
 
       - name: Test
         run: npm test

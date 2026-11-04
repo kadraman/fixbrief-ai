@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   attachReportBack, matchCommentIds, renderReportBackSection, reportBackItem,
-} from "./attach-replies.ts";
-import { findingMarker, type FixBriefTargetsFile } from "./findings.ts";
+} from "../src/attach-replies.ts";
+import { findingMarker, type FixBriefTargetsFile } from "../src/findings.ts";
 
 const targets: FixBriefTargetsFile = {
   schemaVersion: 1,
@@ -22,13 +22,20 @@ const targets: FixBriefTargetsFile = {
   ],
 };
 
-test("matchCommentIds maps reviewbrief markers to comment ids", () => {
+test("matchCommentIds maps fixbrief-ai markers to comment ids", () => {
   const matched = matchCommentIds(targets.targets, [
     { id: 1001, body: `note\n\n${findingMarker("RB1")}` },
     { id: 1002, body: "unrelated" },
   ]);
   assert.equal(matched.get("RB1"), 1001);
   assert.equal(matched.has("RB2"), false);
+});
+
+test("matchCommentIds accepts legacy reviewbrief markers", () => {
+  const matched = matchCommentIds(targets.targets, [
+    { id: 2001, body: "legacy\n\n<!-- reviewbrief:RB1 -->" },
+  ]);
+  assert.equal(matched.get("RB1"), 2001);
 });
 
 test("reportBackItem uses thread reply when a comment id is known", () => {
@@ -52,7 +59,7 @@ test("renderReportBackSection lists reply commands for matched and unmatched fin
 });
 
 test("attachReportBack appends and replaces the Report back section", () => {
-  const dir = mkdtempSync(join(tmpdir(), "reviewbrief-attach-"));
+  const dir = mkdtempSync(join(tmpdir(), "fixbrief-ai-attach-"));
   const briefPath = join(dir, "fix-brief.md");
   writeFileSync(briefPath, "# Fix brief\n\n## Findings\n\n### 1. Null check\n");
   attachReportBack({

@@ -1,59 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseDiffLines, annotateDiff, anchorFindings } from "./difflines.ts";
 import {
-  applySeverityPolicy, findingRejectReason, githubReviewPayload, isTypingStyleNit, parseFindingMarker,
-  parseResponse, renderFinding, repairFindingsPrompt, reviewOverviewBody, toReviewComment,
-} from "./findings.ts";
+  applySeverityPolicy, findingRejectReason, fixBriefFindings, githubReviewPayload, isTypingStyleNit,
+  parseFindingMarker, parseResponse, partitionInline, publishableFindings, qualifiesForFixBrief,
+  qualifiesForInline, rankFindings, renderFinding, repairFindingsPrompt, reviewOverviewBody,
+} from "../src/findings.ts";
 
-const DIFF = [
-  "diff --git a/a.py b/a.py", "index 111..222 100644", "--- a/a.py", "+++ b/a.py",
-  "@@ -1,4 +1,5 @@", " line1", "-old2", "+new2", "+new3", " line3", " line4",
-  "@@ -20,2 +21,2 @@", " ctx20", "-gone", "+++ looks like header",
-  "diff --git a/new.txt b/new.txt", "new file mode 100644", "--- /dev/null", "+++ b/new.txt",
-  "@@ -0,0 +1,2 @@", "+hello", "+world", "\\ No newline at end of file",
-  "diff --git a/del.txt b/del.txt", "deleted file mode 100644", "--- a/del.txt", "+++ /dev/null",
-  "@@ -1,2 +0,0 @@", "-x", "-y", "",
-].join("\n");
-
-const sorted = (s: Set<number>) => [...s].sort((a, b) => a - b);
 const sig = (o: any) => ({ id: "S", category: "security", severity: "high", confidence: 0.95, file: "a.py", line: 2, title: "t", description: "d", ...o });
-
-test("parseDiffLines maps new-side lines, ignores deletions and '+++' content lines", () => {
-  const m = parseDiffLines(DIFF);
-  assert.deepEqual(sorted(m.get("a.py")!.added), [2, 3, 22]);
-  assert.deepEqual(sorted(m.get("a.py")!.context), [1, 4, 5, 21]);
-  assert.deepEqual(sorted(m.get("new.txt")!.added), [1, 2]);
-  assert.equal(m.has("del.txt"), false);
-});
-
-test("annotateDiff numbers only added/context lines", () => {
-  const out = annotateDiff(DIFF.split("diff --git a/new.txt")[0]).split("\n");
-  assert.ok(out.includes("    1  line1"));
-  assert.ok(out.includes("      -old2"));
-  assert.ok(out.includes("    2 +new2"));
-  assert.ok(out.some((l) => l.startsWith("   22 +")));
-});
-
-test("anchorFindings: valid, invalid line, valid range, cross-hunk range drops suggestion", () => {
-  const m = parseDiffLines(DIFF);
-  const r = anchorFindings([
-    sig({ line: 2 }), sig({ line: 99 }), sig({ file: "nope.py" }),
-    sig({ line: 2, endLine: 4, suggestion: "x" }), sig({ line: 5, endLine: 21, suggestion: "y" }), sig({ file: "./a.py", line: 22 }),
-  ] as any, m);
-  assert.equal(r.anchored.length, 4);
-  assert.equal(r.unanchored.length, 2);
-  assert.equal(r.anchored[1].endLine, 4);
-  assert.equal(r.anchored[2].endLine, undefined);
-  assert.equal(r.anchored[2].suggestion, undefined);
-  assert.equal(r.anchored[3].file, "a.py");
-});
-
-test("range comments carry start_line", () => {
-  const c = toReviewComment(sig({ line: 2, endLine: 4 }) as any, "b");
-  assert.deepEqual([c.start_line, c.line, c.start_side], [2, 4, "RIGHT"]);
-  assert.equal("start_line" in toReviewComment(sig({ line: 2 }) as any, "b"), false);
-});
 
 test("parseResponse: prose is not ok, empty array is ok, array recommendation survives rendering", () => {
   assert.equal(parseResponse("Looks fine overall.").ok, false);
@@ -124,29 +77,6 @@ test("TypeScript any / type-assertion nits are rejected", () => {
   assert.match(parsed.rejected[0].reason, /typing\/style nit/);
 });
 
-test("CRLF diffs match LF line maps and annotate blank context", () => {
-  const lf = [
-    "diff --git a/a.py b/a.py", "--- a/a.py", "+++ b/a.py",
-    "@@ -1,3 +1,3 @@", " keep", "", "+added",
-  ].join("\n");
-  const crlf = lf.replace(/\n/g, "\r\n");
-  const lfMap = parseDiffLines(lf);
-  const crlfMap = parseDiffLines(crlf);
-  assert.deepEqual(sorted(lfMap.get("a.py")!.added), sorted(crlfMap.get("a.py")!.added));
-  assert.deepEqual(sorted(lfMap.get("a.py")!.context), sorted(crlfMap.get("a.py")!.context));
-  assert.ok(annotateDiff(crlf).includes("    2  "));
-});
-
-test("anchorFindings drops absurd endLine without hanging", () => {
-  const m = parseDiffLines(DIFF);
-  const started = Date.now();
-  const r = anchorFindings([sig({ line: 2, endLine: 2_147_483_647, suggestion: "x" }) as any], m);
-  assert.ok(Date.now() - started < 1_000);
-  assert.equal(r.anchored.length, 1);
-  assert.equal(r.anchored[0].endLine, undefined);
-  assert.equal(r.anchored[0].suggestion, undefined);
-});
-
 test("renderFinding picks a fence longer than any backtick run in the suggestion", () => {
   const body = renderFinding(sig({ suggestion: "use ````code```` here" }) as any, 2000);
   assert.match(body, /\n`````suggestion\n/);
@@ -174,12 +104,11 @@ test("renderFinding keeps a short suggestion by shrinking long prose first", () 
   const body = renderFinding(sig({
     description: longDesc,
     recommendation: "Pin to a commit SHA.",
-    suggestion: "uses: kadraman/reviewbrief@abc123",
+    suggestion: "uses: kadraman/fixbrief-ai@abc123",
   }) as any, 800);
-  assert.match(body, /```suggestion\nuses: kadraman\/reviewbrief@abc123\n```/);
+  assert.match(body, /```suggestion\nuses: kadraman\/fixbrief-ai@abc123\n```/);
   assert.doesNotMatch(body, /Suggestion omitted/);
   assert.ok(body.length <= 800);
-  // Long prose was compressed (not left intact) so the suggestion could stay.
   assert.ok(!body.includes(longDesc));
   assert.match(body, /D…/);
   assert.equal(parseFindingMarker(body), "S");
@@ -207,14 +136,14 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
   const emptyWithBelow = reviewOverviewBody([], 0.85, { belowGateCount: 3 });
   assert.match(emptyWithBelow, /3 other findings were scored but stayed below the publish gate/);
   const body = reviewOverviewBody([
-    sig({ severity: "high", title: "CRLF blank context", file: "scripts/difflines.ts", line: 34 }),
-    sig({ severity: "critical", confidence: 0.95, title: "Fence length", file: "scripts/findings.ts", line: 128 }),
+    sig({ severity: "high", title: "CRLF blank context", file: "src/difflines.ts", line: 34 }),
+    sig({ severity: "critical", confidence: 0.95, title: "Fence length", file: "src/findings.ts", line: 128 }),
   ] as any, 0.85, {
     title: "Fix CRLF and fence length",
     body: "This PR hardens the diff parser.\n\n## Changes\n- Fix CRLF context\n- Fix fence length\n",
     files: [
-      { path: "scripts/difflines.ts", reviewed: true, comments: 1 },
-      { path: "scripts/findings.ts", reviewed: true, comments: 1 },
+      { path: "src/difflines.ts", reviewed: true, comments: 1 },
+      { path: "src/findings.ts", reviewed: true, comments: 1 },
       { path: "other.py", reviewed: false, comments: 0, note: "not on reviewed diff" },
     ],
     unanchored: [sig({
@@ -227,10 +156,10 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
   assert.match(body, /This PR hardens the diff parser\./);
   assert.match(body, /\*\*Changes:\*\*/);
   assert.match(body, /- Fix CRLF context/);
-  assert.match(body, /ReviewBrief reviewed 2 out of 3 changed files/);
+  assert.match(body, /FixBrief AI reviewed 2 out of 3 changed files/);
   assert.match(body, /generated 2 comments/);
   assert.match(body, /Show a summary per file/);
-  assert.match(body, /`scripts\/difflines\.ts`: reviewed, 1 comment/);
+  assert.match(body, /`src\/difflines\.ts`: reviewed, 1 comment/);
   assert.doesNotMatch(body, /\| Severity \| Count \|/);
   assert.doesNotMatch(body, /confidence ≥/);
   assert.match(body, /### Could not place inline/);
@@ -252,7 +181,7 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
   });
   assert.match(payload.body, /## Pull request overview/);
   assert.match(payload.body, /generated 1 comment/);
-  assert.doesNotMatch(payload.body, /\*\*Keep\*\*/); // findings live on inline threads, not the overview list
+  assert.doesNotMatch(payload.body, /\*\*Keep\*\*/);
   assert.doesNotMatch(payload.body, /Also noted/);
   assert.doesNotMatch(payload.body, /\*\*Drop\*\*/);
   assert.doesNotMatch(payload.body, /\*\*Low severity drop\*\*/);
@@ -272,4 +201,98 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
   assert.match(capped.body, /### Over the inline cap/);
   assert.match(capped.body, /\*\*Second\*\*/);
   assert.match(capped.body, /\*\*Recommendation:\*\* Raise the cap\./);
+});
+
+test("normalizeFinding maps confidence levels and numbers; missing is low", () => {
+  const level = (c: unknown) => parseResponse(JSON.stringify({ findings: [{ category: "quality", severity: "low", file: "a", line: 1, title: "t", description: "d", confidence: c }] })).findings[0];
+  assert.deepEqual(["high", "MEDIUM", 0.9, "70%", 0.2, undefined].map((c) => level(c).level), ["high", "medium", "high", "medium", "low", "low"]);
+  assert.equal(level("high").confidence, 0.75);
+  assert.equal(parseResponse(JSON.stringify({ findings: [{ category: "quality", severity: "low", file: "a", line: 1, title: "t", description: "d", confidence: "high", evidence: "x = 1" }] })).findings[0].evidence, "x = 1");
+});
+
+test("rankFindings/partitionInline: highest-confidence duplicate wins, threshold, cap, input order does not matter", () => {
+  const mk = (o: any) => ({ id: "S", category: "security", severity: "high", confidence: 0.9, file: "a.py", line: 3, title: "t", description: "d", ...o });
+  const input = [mk({ confidence: 0.86 }), mk({ confidence: 0.95 }), mk({ line: 5, title: "u", severity: "critical" }), mk({ line: 7, title: "v", confidence: 0.5 }), mk({ line: 9, title: "w", confidence: 0.85 })] as any;
+  const part = partitionInline(input, 0.85, 0);
+  assert.deepEqual(part.inline.map((s) => [s.line, s.confidence]), [[5, 0.9], [3, 0.95], [9, 0.85]]);
+  assert.deepEqual(part.belowConfidence.map((s) => s.line), [7]);
+  assert.equal(part.capped.length, 0);
+  const capped = partitionInline(input, 0.85, 2);
+  assert.equal(capped.inline.length, 2);
+  assert.deepEqual(capped.capped.map((s) => s.line), [9]);
+  assert.deepEqual(partitionInline([...input].reverse(), 0.85, 0), part);
+  assert.deepEqual(rankFindings([...input].reverse()), rankFindings(input));
+  const a = mk({ category: "quality" }), b = mk({ category: "security" });
+  assert.deepEqual(rankFindings([b, a] as any).map((s) => s.category), ["quality", "security"]);
+});
+
+test("qualifiesForInline: only critical/high above confidence floor; medium/low/info never inline", () => {
+  const mk = (o: any) => ({ id: "S", category: "quality", severity: "high", confidence: 0.85, file: "a.py", line: 1, title: "t", description: "d", ...o });
+  assert.equal(qualifiesForInline(mk({}) as any, 0.85), true);
+  assert.equal(qualifiesForInline(mk({ severity: "critical", confidence: 0.85 }) as any, 0.85), true);
+  assert.equal(qualifiesForInline(mk({ severity: "high", confidence: 0.84 }) as any, 0.85), false);
+  assert.equal(qualifiesForInline(mk({ severity: "medium", confidence: 0.99 }) as any, 0.85), false);
+  assert.equal(qualifiesForInline(mk({ severity: "low", confidence: 0.99 }) as any, 0.85), false);
+  assert.equal(qualifiesForInline(mk({ severity: "info", confidence: 0.99 }) as any, 0.85), false);
+  const gated = partitionInline([
+    mk({ line: 1, severity: "high", confidence: 0.9 }),
+    mk({ line: 2, severity: "critical", confidence: 0.85, title: "crit" }),
+    mk({ line: 3, severity: "medium", confidence: 0.99, title: "m-hi" }),
+    mk({ line: 4, severity: "low", confidence: 0.99, title: "low" }),
+  ] as any, 0.85, 0);
+  assert.deepEqual(gated.inline.map((s) => s.line), [2, 1]);
+  assert.deepEqual(gated.belowConfidence.map((s) => s.line).sort((a, b) => a - b), [3, 4]);
+});
+
+test("fix brief includes PR-gated findings plus medium at ≥ 0.75; skips low/info", () => {
+  const mk = (o: any) => ({ id: "S", category: "quality", severity: "high", confidence: 0.85, file: "a.py", line: 1, title: "t", description: "d", ...o });
+  assert.equal(qualifiesForFixBrief(mk({}) as any, 0.85), true);
+  assert.equal(qualifiesForFixBrief(mk({ severity: "medium", confidence: 0.75, title: "m" }) as any, 0.85), true);
+  assert.equal(qualifiesForFixBrief(mk({ severity: "medium", confidence: 0.74, title: "m-low" }) as any, 0.85), false);
+  assert.equal(qualifiesForFixBrief(mk({ severity: "low", confidence: 0.99, title: "low" }) as any, 0.85), false);
+  assert.equal(qualifiesForFixBrief(mk({ severity: "info", confidence: 0.99, title: "info" }) as any, 0.85), false);
+  assert.equal(qualifiesForFixBrief(mk({ severity: "high", confidence: 0.84, title: "hi-low" }) as any, 0.85), false);
+  const brief = fixBriefFindings([
+    mk({ line: 1, severity: "high", confidence: 0.9, title: "keep-high" }),
+    mk({ line: 2, severity: "medium", confidence: 0.75, title: "keep-med" }),
+    mk({ line: 3, severity: "medium", confidence: 0.74, title: "drop-med" }),
+    mk({ line: 4, severity: "low", confidence: 0.9, title: "drop-low" }),
+  ] as any, 0.85);
+  assert.deepEqual(brief.map((s) => s.title), ["keep-high", "keep-med"]);
+});
+
+test("requireMultiRun: one-off high still publishes; one-off medium stays out of the fix brief", () => {
+  const mk = (o: any) => ({
+    id: "S", category: "quality", severity: "high", confidence: 0.95, file: "a.py", line: 1, title: "t", description: "d",
+    confidenceBreakdown: { level: "high", base: 0.75, anchor: "added", anchorDelta: 0.1, evidence: "found", evidenceDelta: 0.1, agreement: "all", agreementDelta: 0.1 },
+    ...o,
+  });
+  const agreed = mk({ title: "agreed" });
+  const once = mk({
+    title: "once", line: 2, confidence: 0.85, confidenceBreakdown: {
+      level: "high", base: 0.75, anchor: "added", anchorDelta: 0.1, evidence: "found", evidenceDelta: 0.1,
+      agreement: "single", agreementDelta: -0.1,
+    },
+  });
+  const medOnce = mk({
+    title: "med-once", line: 3, severity: "medium", confidence: 0.75, confidenceBreakdown: {
+      level: "medium", base: 0.55, anchor: "added", anchorDelta: 0.1, evidence: "found", evidenceDelta: 0.1,
+      agreement: "single", agreementDelta: -0.1,
+    },
+  });
+  const medAgreed = mk({
+    title: "med-agreed", line: 4, severity: "medium", confidence: 0.75, confidenceBreakdown: {
+      level: "medium", base: 0.55, anchor: "added", anchorDelta: 0.1, evidence: "found", evidenceDelta: 0.1,
+      agreement: "all", agreementDelta: 0.1,
+    },
+  });
+  assert.equal(qualifiesForInline(agreed as any, 0.85, true), true);
+  assert.equal(qualifiesForInline(once as any, 0.85, true), true);
+  assert.equal(qualifiesForFixBrief(once as any, 0.85, 0.75, true), true);
+  assert.equal(qualifiesForFixBrief(medOnce as any, 0.85, 0.75, true), false);
+  assert.equal(qualifiesForFixBrief(medAgreed as any, 0.85, 0.75, true), true);
+  const published = publishableFindings([agreed, once] as any, [], 0.85, 0, true);
+  assert.deepEqual(published.inline.map((s) => s.title), ["agreed", "once"]);
+  assert.deepEqual(fixBriefFindings([agreed, once, medOnce, medAgreed] as any, 0.85, 0.75, true).map((s) => s.title),
+    ["agreed", "once", "med-agreed"]);
 });

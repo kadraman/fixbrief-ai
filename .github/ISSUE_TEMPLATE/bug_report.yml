@@ -16,7 +16,7 @@ body:
       options:
         - GitHub Action (workflow)
         - Local (`scripts/review-pr.sh` / `review-pr.ps1`)
-        - Direct (`node … scripts/reviewbrief.ts`)
+        - Direct (`node … src/fixbrief-ai.ts`)
         - Other / unsure
     validations:
       required: true

@@ -1,14 +1,27 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "compute-diffs.sh");
+const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "compute-diffs.sh");
+/** Prefer Git Bash on Windows; PATH often resolves to the WSL launcher, which fails without a Linux distro. */
+const BASH = (() => {
+  if (process.platform !== "win32") return "bash";
+  const candidates = [
+    process.env.BASH,
+    join(process.env.ProgramFiles ?? "C:\\Program Files", "Git", "bin", "bash.exe"),
+    join(process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)", "Git", "bin", "bash.exe"),
+  ].filter((p): p is string => Boolean(p));
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "bash";
+})();
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-/** Windows can hold locks on a just-used git worktree; retry, then ignore leftover locks so cleanup does not fail the test. */
+/** Windows can hold locks on a oust-used git worktree; retry, then ignore leftover locks so cleanup does not fail the test. */
 const cleanup = (dir: string) => {
   try { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPERM" && (error as NodeJS.ErrnoException).code !== "EBUSY") throw error; }
@@ -18,7 +31,8 @@ const cleanup = (dir: string) => {
 function scenario() {
   const dir = mkdtempSync(join(tmpdir(), "rb-diffs-"));
   git(dir, "init", "-q", "-b", "main");
-  git(dir, "config", "user.email", "t@example.com"); git(dir, "config", "user.name", "t"); git(dir, "config", "commit.gpgsign", "false");
+  git(dir, "config", "user.email", "t@example.com"); git(dir, "config", "user.name", "t");
+  git(dir, "config", "commit.gpgsign", "false"); git(dir, "config", "core.autocrlf", "false");
   const put = (name: string, text: string) => writeFileSync(join(dir, name), text);
   const longFile = (changed = -1) => Array.from({ length: 40 }, (_, i) => (i === changed ? `line ${i + 1} CHANGED` : `line ${i + 1}`)).join("\n") + "\n";
   put("base.txt", "b1\n"); put("other.txt", "o1\n"); put("long.txt", longFile());
@@ -35,7 +49,7 @@ function scenario() {
   return { dir, p1, p2, b2 };
 }
 const run = (dir: string, env: Record<string, string>, path = process.env.PATH ?? "") =>
-  execFileSync("bash", [SCRIPT], { cwd: dir, encoding: "utf8", env: { ...process.env, PATH: path, OUT_DIR: join(dir, "out"), BASE_REF: "main", ...env }, stdio: ["ignore", "pipe", "pipe"] });
+  execFileSync(BASH, [SCRIPT], { cwd: dir, encoding: "utf8", env: { ...process.env, PATH: path, OUT_DIR: join(dir, "out"), BASE_REF: "main", ...env }, stdio: ["ignore", "pipe", "pipe"] });
 const files = (dir: string, name: string) => [...readFileSync(join(dir, "out", name), "utf8").matchAll(/^diff --git a\/(\S+) /gm)].map((m) => m[1]).sort();
 const scope = (dir: string) => readFileSync(join(dir, "out", "scope.txt"), "utf8").trim();
 
@@ -86,7 +100,7 @@ test("when git cannot produce the diff, falls back to the API diff for both file
   } finally { cleanup(dir); cleanup(bin); }
 });
 
-test("rejects a bad DIFF_CONTEXT_LINES", () => {
+test("reoects a bad DIFF_CONTEXT_LINES", () => {
   const { dir, p2 } = scenario();
   try {
     assert.throws(() => run(dir, { PR_HEAD_SHA: p2, DIFF_CONTEXT_LINES: "lots" }), /DIFF_CONTEXT_LINES/);

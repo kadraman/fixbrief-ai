@@ -216,12 +216,12 @@ export function parseFindings(response: string): Finding[] { return parseRespons
 
 /** Hidden HTML marker so a later step can match an inline thread to a finding id. */
 export function findingMarker(id: string): string {
-  return `<!-- reviewbrief:${id.replace(/-->/g, "")} -->`;
+  return `<!-- fixbrief-ai:${id.replace(/-->/g, "")} -->`;
 }
 
-/** Extract the finding id from a comment body that contains a reviewbrief marker. */
+/** Extract the finding id from a comment body that contains a fixbrief-ai (or legacy reviewbrief) marker. */
 export function parseFindingMarker(body: string): string | undefined {
-  const match = /<!--\s*reviewbrief:([^\s-->][^>]*)\s*-->/.exec(body);
+  const match = /<!--\s*(?:fixbrief-ai|reviewbrief):([^\s-->][^>]*)\s*-->/.exec(body);
   return match?.[1]?.trim() || undefined;
 }
 
@@ -449,7 +449,7 @@ export function reviewOverviewBody(
   parts.push(
     "**Reviewed changes**",
     "",
-    `ReviewBrief reviewed ${reviewedCount} out of ${totalFiles || reviewedCount || "?"} changed file${(totalFiles || reviewedCount) === 1 ? "" : "s"} in this pull request and generated ${commentCount} comment${commentCount === 1 ? "" : "s"}.`,
+    `FixBrief AI reviewed ${reviewedCount} out of ${totalFiles || reviewedCount || "?"} changed file${(totalFiles || reviewedCount) === 1 ? "" : "s"} in this pull request and generated ${commentCount} comment${commentCount === 1 ? "" : "s"}.`,
     "",
   );
   if (!inline.length) {

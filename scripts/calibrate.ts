@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * reviewbrief calibration harness.
+ * fixbrief-ai calibration harness.
  *
  * Runs the review engine over previously closed PRs of a repository, collects every finding it produces,
  * lets you label them (true positive / false positive), and reports how precise each confidence level is,
@@ -23,7 +23,7 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SCORING } from "./confidence.ts";
+import { SCORING } from "../src/confidence.ts";
 
 /** Load KEY=VALUE lines from a .env file without overriding variables already set in the environment. */
 function loadDotEnv(path: string): void {
@@ -200,7 +200,7 @@ function collect(opts: Options): void {
   const out = outDir(opts, repo);
   const runs = Math.max(1, numOpt(opts, "runs", 1));
   const maxDiffChars = numOpt(opts, "max-diff-chars", 400000);
-  const engine = String(opts.engine ?? join(HERE, "reviewbrief.ts"));
+  const engine = String(opts.engine ?? join(HERE, "../src/fixbrief-ai.ts"));
   const prs = listPrs(repo, opts);
 
   console.log(`Selected ${prs.length} closed PR(s) from ${repo}; ${prs.length * runs} engine run(s) planned.\n`);
@@ -405,7 +405,7 @@ function report(opts: Options): void {
   const prs = new Set(rows.map((r) => r.pr));
   const overall = tally(rows);
   const labeled = overall.tp + overall.fp;
-  const md: string[] = [`# reviewbrief calibration report: ${repo}`, "",
+  const md: string[] = [`# FixBrief AI calibration report: ${repo}`, "",
     ...(opts.rescore ? ["_Confidence values were recomputed with the current SCORING constants (`--rescore`)._", ""] : []),
     `- PRs analysed: **${prs.size}**; findings: **${rows.length}** (${(rows.length / prs.size).toFixed(1)} per PR)`,
     `- labels: tp ${overall.tp}, fp ${overall.fp}, unsure ${overall.unsure}, unlabeled ${overall.unlabeled}`,

@@ -1,4 +1,4 @@
-# Copy this to .github/workflows/reviewbrief.yml in the repo you want reviewed.
+# Copy this to .github/workflows/fixbrief-ai.yml in the repo you want reviewed.
 #
 # Settings > Secrets and variables > Actions:
 #   Secret    LLM_API_KEY    your provider's API key
@@ -14,7 +14,7 @@
 # Default consistency-runs is 2: agreement adjusts confidence; critical/high that
 # clear the floor still publish as one-offs.
 
-name: reviewbrief
+name: FixBrief AI - PR Review
 
 on:
   pull_request:
@@ -36,7 +36,7 @@ jobs:
           fetch-depth: 0   # full history, so large diffs aren't limited by GitHub's API
                            # and synchronize can resolve github.event.before
 
-      - uses: kadraman/reviewbrief@v1   # or "./" when testing inside this repo
+      - uses: kadraman/fixbrief-ai@v1
         with:
           api-key: ${{ secrets.LLM_API_KEY }}
           model: ${{ vars.LLM_MODEL }}

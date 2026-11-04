@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest an enhancement for ReviewBrief
+description: Suggest an enhancement for FixBrief AI
 title: "[Feature]: "
 labels: ["enhancement", "needs triage"]
 body:
@@ -21,7 +21,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: How should ReviewBrief behave?
+      description: How should FixBrief AI behave?
     validations:
       required: true
 

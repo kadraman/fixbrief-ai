@@ -1,4 +1,4 @@
-name: reviewbrief
+name: FixBrief AI
 description: AI-powered pull request reviews with any LLM, large-PR support, and fix briefs for AI coding assistants.
 author: kadraman
 
@@ -101,7 +101,7 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
-        OUT_DIR: ${{ runner.temp }}/reviewbrief
+        OUT_DIR: ${{ runner.temp }}/fixbrief-ai
         BASE_REF: ${{ github.base_ref }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         BEFORE_SHA: ${{ github.event.before }}
@@ -112,7 +112,7 @@ runs:
       run: |
         set -euo pipefail
         if [ -z "${BASE_REF:-}" ]; then
-          echo "::error::reviewbrief must run on a pull_request event."
+          echo "::error::fixbrief-ai must run on a pull_request event."
           exit 1
         fi
         bash "$ACTION_PATH/scripts/compute-diffs.sh"
@@ -141,7 +141,7 @@ runs:
         MINIMUM_CONFIDENCE: ${{ inputs.minimum-confidence }}
         MAX_INLINE_COMMENTS: ${{ inputs.max-inline-comments }}
         FIX_BRIEF: ${{ inputs.fix-brief }}
-        ANCHOR_DIFF_FILE: ${{ runner.temp }}/reviewbrief/anchor.diff
+        ANCHOR_DIFF_FILE: ${{ runner.temp }}/fixbrief-ai/anchor.diff
         CONTEXT_CHARS: ${{ inputs.context-chars }}
         PR_TITLE: ${{ github.event.pull_request.title }}
         PR_BODY: ${{ github.event.pull_request.body }}
@@ -153,7 +153,7 @@ runs:
         BASE_REF: ${{ github.base_ref }}
       run: |
         set -euo pipefail
-        out="$RUNNER_TEMP/reviewbrief"
+        out="$RUNNER_TEMP/fixbrief-ai"
         scope="$(cat "$out/scope.txt" 2>/dev/null || echo full)"
         if [ "$scope" = "incremental" ] && [ -n "${BEFORE_SHA:-}" ]; then
           SHORT="$(git rev-parse --short "$BEFORE_SHA" 2>/dev/null || echo "${BEFORE_SHA:0:7}")"
@@ -161,7 +161,7 @@ runs:
         else
           export REVIEW_SCOPE="Reviewed the full pull request diff against origin/${BASE_REF}."
         fi
-        node --experimental-strip-types "$ACTION_PATH/scripts/reviewbrief.ts" --diff "$out/pr.diff" --out-dir "$out"
+        node --experimental-strip-types "$ACTION_PATH/src/fixbrief-ai.ts" --diff "$out/pr.diff" --out-dir "$out"
         echo "review_path=$out/review.md" >> "$GITHUB_OUTPUT"
         if [ -f "$out/fix-brief.md" ]; then
           echo "has_brief=true" >> "$GITHUB_OUTPUT"
@@ -182,7 +182,7 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        OUT="$RUNNER_TEMP/reviewbrief"
+        OUT="$RUNNER_TEMP/fixbrief-ai"
         POSTED=false
         REVIEW_ID=""
         echo "[]" > "$OUT/posted-comments.json"
@@ -270,7 +270,7 @@ runs:
         BRIEF_PATH: ${{ steps.review.outputs.brief_path }}
       run: |
         set -euo pipefail
-        OUT="$RUNNER_TEMP/reviewbrief"
+        OUT="$RUNNER_TEMP/fixbrief-ai"
         TARGETS="$OUT/fix-brief-targets.json"
         COMMENTS="$OUT/posted-comments.json"
         if [ ! -f "$COMMENTS" ]; then echo "[]" > "$COMMENTS"; fi
@@ -278,7 +278,7 @@ runs:
           echo "No fix-brief-targets.json; skipping report-back attach."
           exit 0
         fi
-        node --experimental-strip-types "$ACTION_PATH/scripts/attach-replies.ts" \
+        node --experimental-strip-types "$ACTION_PATH/src/attach-replies.ts" \
           --brief "$BRIEF_PATH" --targets "$TARGETS" --comments "$COMMENTS"
 
     - name: Upload fix brief
@@ -306,7 +306,7 @@ runs:
           echo "No artifact URL; skipping review body patch."
           exit 0
         fi
-        PATCH="$RUNNER_TEMP/reviewbrief/review-body-patch.json"
+        PATCH="$RUNNER_TEMP/fixbrief-ai/review-body-patch.json"
         node --input-type=module -e '
           import { readFileSync, writeFileSync } from "node:fs";
           const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
@@ -322,11 +322,11 @@ runs:
       if: always() && inputs.debug-artifacts == 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: reviewbrief-debug-pr-${{ github.event.pull_request.number }}
+        name: fixbrief-ai-debug-pr-${{ github.event.pull_request.number }}
         path: |
-          ${{ runner.temp }}/reviewbrief/findings.json
-          ${{ runner.temp }}/reviewbrief/review-payload.json
-          ${{ runner.temp }}/reviewbrief/fix-brief-targets.json
-          ${{ runner.temp }}/reviewbrief/scope.txt
+          ${{ runner.temp }}/fixbrief-ai/findings.json
+          ${{ runner.temp }}/fixbrief-ai/review-payload.json
+          ${{ runner.temp }}/fixbrief-ai/fix-brief-targets.json
+          ${{ runner.temp }}/fixbrief-ai/scope.txt
         retention-days: 7
         if-no-files-found: ignore

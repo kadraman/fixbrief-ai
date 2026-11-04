@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const ENGINE = join(dirname(fileURLToPath(import.meta.url)), "reviewbrief.ts");
+const ENGINE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src", "fixbrief-ai.ts");
 
 type Seen = { system: string; user: string };
 type Reply = { status: number; content?: string; delayMs?: number };
@@ -32,11 +32,11 @@ async function withMock(handler: (call: number, seen: Seen) => Reply, run: (base
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("expected TCP address");
   try { await run(`http://127.0.0.1:${address.port}/v1`, seen); }
-  finally { await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve())); }
+  finally { await new Promise<void>((resolve, reoect) => server.close((err) => err ? reoect(err) : resolve())); }
 }
 
 function runEngine(baseUrl: string, cwd: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve, reoect) => {
     const child = spawn(process.execPath, ["--experimental-strip-types", ENGINE, ...args, "--no-fix-brief"], {
       cwd,
       env: { ...process.env, LLM_API_KEY: "k", LLM_MODEL: "m", LLM_PROVIDER: "openai", LLM_BASE_URL: baseUrl, LLM_RETRY_DELAY: "0",
@@ -46,7 +46,7 @@ function runEngine(baseUrl: string, cwd: string, args: string[], extraEnv: Recor
     let stdout = "", stderr = "";
     child.stdout.on("data", (d) => { stdout += d; });
     child.stderr.on("data", (d) => { stderr += d; });
-    child.on("error", reject);
+    child.on("error", reoect);
     child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
   });
 }
@@ -55,7 +55,8 @@ const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd,
 function makeRepo(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "rb-ctx-"));
   git(dir, "init", "-q");
-  git(dir, "config", "user.email", "t@example.com"); git(dir, "config", "user.name", "t"); git(dir, "config", "commit.gpgsign", "false");
+  git(dir, "config", "user.email", "t@example.com"); git(dir, "config", "user.name", "t");
+  git(dir, "config", "commit.gpgsign", "false"); git(dir, "config", "core.autocrlf", "false");
   write(dir, files);
   git(dir, "add", "-A"); git(dir, "commit", "-q", "-m", "base");
   return dir;
@@ -143,7 +144,7 @@ test("e2e: with --anchor-diff, lines outside GitHub's PR diff are not anchored e
       const without = await runEngine(baseUrl, repo, ["--diff", "review.diff", "--out-dir", "out"]);
       assert.equal(without.code, 0, without.stderr);
       const b = findingsJson(repo);
-      assert.equal(byTitle(b.findings, "context only").anchored, true, "without --anchor-diff the wide diff makes line 8 look commentable (GitHub would reject it)");
+      assert.equal(byTitle(b.findings, "context only").anchored, true, "without --anchor-diff the wide diff makes line 8 look commentable (GitHub would reoect it)");
     });
   } finally { rmSync(repo, { recursive: true, force: true }); }
 });
@@ -187,13 +188,13 @@ test("e2e: --diff - and --anchor-diff - reuse stdin once (no second read of fd 0
   const dir = mkdtempSync(join(tmpdir(), "rb-stdin-"));
   const diff = ["diff --git a/a.py b/a.py", "--- a/a.py", "+++ b/a.py", "@@ -1,1 +1,2 @@", " keep", "+added"].join("\n");
   try {
-    const result = await new Promise<{ code: number; stderr: string }>((resolve, reject) => {
+    const result = await new Promise<{ code: number; stderr: string }>((resolve, reoect) => {
       const child = spawn(process.execPath, ["--experimental-strip-types", ENGINE, "--diff", "-", "--anchor-diff", "-", "--out-dir", "out", "--dry-run"], {
         cwd: dir, env: { ...process.env, LLM_API_KEY: "k", LLM_MODEL: "m", LLM_PROVIDER: "openai" }, windowsHide: true,
       });
       let stderr = "";
       child.stderr.on("data", (d) => { stderr += d; });
-      child.on("error", reject);
+      child.on("error", reoect);
       child.on("close", (code) => resolve({ code: code ?? 1, stderr }));
       child.stdin.end(diff);
     });

@@ -7,10 +7,18 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
-const SCRIPT = join(ROOT, "reviewbrief.ts");
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const SCRIPT = join(REPO_ROOT, "src", "fixbrief-ai.ts");
 
-// a.py new-file lines: 1 context "import os", 2 "def run(cmd):", 3 "    os.system(cmd)", 4 "    return True", 5 context "# end"
+const THREE_FILE_DIFF = [
+  "diff --git a/one.py b/one.py", "index 111..222 100644", "--- a/one.py", "+++ b/one.py",
+  "@@ -1,1 +1,2 @@", " keep", "+added-one",
+  "diff --git a/two.py b/two.py", "index 111..222 100644", "--- a/two.py", "+++ b/two.py",
+  "@@ -1,1 +1,2 @@", " keep", "+added-two",
+  "diff --git a/three.py b/three.py", "index 111..222 100644", "--- a/three.py", "+++ b/three.py",
+  "@@ -1,1 +1,2 @@", " keep", "+added-three",
+].join("\n");
+
 const DIFF = [
   "diff --git a/a.py b/a.py", "index 111..222 100644", "--- a/a.py", "+++ b/a.py",
   "@@ -1,2 +1,5 @@", " import os", "+def run(cmd):", "+    os.system(cmd)", "+    return True", " # end",
@@ -23,8 +31,59 @@ const finding = (o: Record<string, unknown> = {}) => ({
 });
 const findingsJson = (...findings: unknown[]) => JSON.stringify({ findings });
 
+type BatchMode = "partial-fail" | "all-prose";
 type Reply = { status: number; content?: string; message?: string };
 type RequestBody = { temperature?: number; messages?: { role: string; content: string }[] };
+
+function partNumber(body: string): number {
+  const match = /This is part (\d+) of/.exec(body);
+  return match ? Number(match[1]) : 0;
+}
+
+function openaiJson(content: string): string {
+  return JSON.stringify({ choices: [{ message: { content } }] });
+}
+
+async function withBatchMock(mode: BatchMode, run: (baseUrl: string) => Promise<void>): Promise<void> {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      let user = "";
+      try {
+        const parsed = JSON.parse(raw) as { messages?: { role: string; content: string }[] };
+        user = parsed.messages?.find((m) => m.role === "user")?.content ?? "";
+      } catch { /* ignore */ }
+      const part = partNumber(user);
+      if (mode === "all-prose") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(openaiJson("Looks fine overall."));
+        return;
+      }
+      if (part === 3) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "bad request" } }));
+        return;
+      }
+      if (part === 2) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(openaiJson("Looks fine overall."));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(openaiJson('{"findings": []}'));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("expected TCP address");
+  try {
+    await run(`http://127.0.0.1:${address.port}/v1`);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+  }
+}
 
 async function withMock(handler: (call: number, body: RequestBody) => Reply, run: (baseUrl: string, seen: RequestBody[]) => Promise<void>): Promise<void> {
   const seen: RequestBody[] = [];
@@ -53,7 +112,6 @@ function runReview(baseUrl: string, outDir: string, diffPath: string, extraEnv: 
     const child = spawn(process.execPath, ["--experimental-strip-types", SCRIPT, "--diff", diffPath, "--out-dir", outDir, "--no-fix-brief"], {
       env: {
         ...process.env, LLM_API_KEY: "test-key", LLM_MODEL: "mock-model", LLM_PROVIDER: "openai", LLM_BASE_URL: baseUrl,
-        // Default engine consistency-runs is 2; keep unit e2e at 1 unless a test overrides.
         LLM_RETRY_DELAY: "0", WORKERS: "1", FIX_BRIEF: "false", LLM_TEMPERATURE: "", CONSISTENCY_RUNS: "1", ...extraEnv,
       },
       windowsHide: true,
@@ -68,7 +126,7 @@ function runReview(baseUrl: string, outDir: string, diffPath: string, extraEnv: 
 
 async function scenario(diff: string, handler: Parameters<typeof withMock>[0], extraEnv: Record<string, string>,
   check: (r: { code: number; stdout: string; stderr: string }, out: string, seen: RequestBody[]) => void | Promise<void>): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), "reviewbrief-p2-"));
+  const dir = mkdtempSync(join(tmpdir(), "fixbrief-ai-e2e-"));
   const diffPath = join(dir, "pr.diff");
   writeFileSync(diffPath, diff);
   try {
@@ -79,6 +137,43 @@ async function scenario(diff: string, handler: Parameters<typeof withMock>[0], e
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 const readFindings = (dir: string) => JSON.parse(readFileSync(join(dir, "findings.json"), "utf8"));
+
+test("e2e: partial batch failures stay visible and exit 0", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fixbrief-ai-e2e-"));
+  const diffPath = join(dir, "pr.diff");
+  writeFileSync(diffPath, THREE_FILE_DIFF);
+  try {
+    await withBatchMock("partial-fail", async (baseUrl) => {
+      const { code, stdout, stderr } = await runReview(baseUrl, dir, diffPath, { BATCH_CHARS: "1", MAX_BATCHES: "40" });
+      const review = readFileSync(join(dir, "review.md"), "utf8");
+      assert.equal(code, 0, `stdout:\n${stdout}\nstderr:\n${stderr}`);
+      assert.match(review, /Not reviewed \(2 of 3 parts failed\):/);
+      assert.match(review, /two\.py/);
+      assert.match(review, /three\.py/);
+      assert.match(review, /No actionable findings found in the parts that were reviewed\./);
+      assert.match(`${stdout}\n${stderr}`, /::warning::2 of 3 review parts failed/);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("e2e: every batch invalid exits 1 without false empty finding", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fixbrief-ai-e2e-"));
+  const diffPath = join(dir, "pr.diff");
+  writeFileSync(diffPath, THREE_FILE_DIFF);
+  try {
+    await withBatchMock("all-prose", async (baseUrl) => {
+      const { code, stdout, stderr } = await runReview(baseUrl, dir, diffPath, { BATCH_CHARS: "1", MAX_BATCHES: "40" });
+      const review = readFileSync(join(dir, "review.md"), "utf8");
+      assert.equal(code, 1, `stdout:\n${stdout}\nstderr:\n${stderr}`);
+      assert.doesNotMatch(review, /No actionable findings found\./);
+      assert.match(review, /model did not return valid JSON/);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("e2e: invented evidence is penalised, verified evidence is rewarded, and output is reproducible", async () => {
   const reply = (): Reply => ({ status: 200, content: findingsJson(
@@ -122,13 +217,12 @@ test("e2e: two consistency runs reward agreement, penalise one-run findings, and
       const once = file.findings.find((s: any) => s.title === "Once");
       assert.equal(once.confidenceBreakdown.agreement, "single");
       assert.equal(once.confidence, 0.85);
-      assert.equal(once.inline, true); // high one-off still publishes; agreement only adjusted the score
+      assert.equal(once.inline, true);
       assert.equal(file.findings.find((s: any) => s.title === "A").inline, true);
       const payload = JSON.parse(readFileSync(join(out, "review-payload.json"), "utf8"));
       assert.equal(payload.comments.length, 2);
       assert.match(payload.body, /## Pull request overview/);
       assert.match(payload.body, /generated 2 comments/);
-      // Findings live on inline threads (not duplicated in the overview list).
       const bodies = payload.comments.map((c: { body: string }) => c.body).join("\n");
       assert.match(bodies, /\*\*Once\*\*/);
       assert.match(bodies, /\*\*A\*\*/);

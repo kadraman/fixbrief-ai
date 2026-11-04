@@ -31,7 +31,7 @@ export interface ReportBackItem {
   command: string;
 }
 
-/** Match targets to posted review comments by the hidden <!-- reviewbrief:id --> marker. */
+/** Match targets to posted review comments by the hidden <!-- fixbrief-ai:id --> marker. */
 export function matchCommentIds(
   targets: FixBriefTarget[],
   comments: ReviewCommentRef[],
@@ -164,7 +164,7 @@ function readJson<T>(path: string): T {
 
 function usage(): never {
   console.log(`Usage:
-  node --experimental-strip-types scripts/attach-replies.ts \\
+  node --experimental-strip-types src/attach-replies.ts \\
     --brief PATH --targets PATH [--comments PATH] [--out PATH]
 
   --comments PATH   JSON array of {id, body, path?, line?} from the posted review

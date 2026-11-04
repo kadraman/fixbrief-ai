@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { csvEscape, parseCsv, parseJsonStream, wilsonLower } from "./calibrate.ts";
+import { csvEscape, parseCsv, parseJsonStream, wilsonLower } from "../scripts/calibrate.ts";
 
 test("parseJsonStream splits back-to-back pages and ignores brackets inside strings", () => {
   const pages = parseJsonStream('[{"b":"x ] [ } {"}]\n[{"b":2}]  [] {"o":1}');
@@ -21,8 +21,8 @@ test("wilsonLower is conservative for small samples", () => {
   assert.ok(wilsonLower(90, 100) > 0.8 && wilsonLower(90, 100) < 0.9);
 });
 
-import { rescore } from "./calibrate.ts";
-import { SCORING } from "./confidence.ts";
+import { rescore } from "../scripts/calibrate.ts";
+import { SCORING } from "../src/confidence.ts";
 test("rescore reproduces the engine's score from a stored breakdown", () => {
   assert.equal(rescore({ level: "high", anchor: "added", evidence: "found", agreement: "n/a" }), 0.95);
   assert.equal(rescore({ level: "medium", anchor: "added", evidence: "found", agreement: "all" }), 0.85);

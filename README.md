@@ -1,24 +1,32 @@
-# ReviewBrief
+# FixBrief AI
 
 AI-powered pull request review for GitHub that works with **any model** (OpenAI, Claude, DeepSeek, OpenRouter, Ollama, anything OpenAI-compatible), **doesn't truncate large PRs**, and writes a **fix brief**: a markdown prompt you can hand to an AI coding assistant to apply the fixes.
 
 - **Large PRs:** the diff is split per file (and per hunk for huge files), reviewed in batches, then merged into one review. Skipped files and failed batches are listed in the comment, never silently dropped.
-- **Structured findings:** the model returns canonical Findings, which ReviewBrief renders into Copilot-style overview + inline comments (severity top-right) and GitHub suggestions.
+- **Structured findings:** the model returns canonical Findings, which FixBrief AI renders into Copilot-style overview, inline comments and suggestions.
 - **Any provider:** two protocols cover nearly everything: `openai` (OpenAI-compatible) and `anthropic`.
-- **Fix brief:** `fix-brief.md` lists each actionable finding with file, problem, suggested fix and a "done when" check, plus rules that tell the assistant to verify each finding before changing anything.
+- **Fix brief:** creates a `fix-brief.md` that lists each actionable finding with file, problem, suggested fix and a "done when" check, plus rules that tell the assistant to verify each finding before changing anything.
 - **TypeScript runtime:** the review pipeline, canonical Finding model, and renderers run on Node.js 22 without third-party packages.
 
-## What's in the box
+## What's included
 
 ```
 action.yml                 composite GitHub Action
-scripts/reviewbrief.ts     review engine (also runs standalone)
-scripts/context.ts         per-batch reference context (PR overview, guidance, symbol usages)
-scripts/compute-diffs.sh   review diff + GitHub PR anchor diff for Actions
-scripts/findings.ts        canonical Finding types and GitHub renderer
-scripts/attach-replies.ts  attach per-finding PR reply commands to fix-brief.md
-scripts/review-pr.sh       run it against an existing PR from your machine
-examples/reviewbrief.yml   workflow that uses the action
+src/                       TypeScript library and engine
+  fixbrief-ai.ts           review engine (also runs standalone)
+  findings.ts              canonical Finding types and GitHub renderer
+  confidence.ts            evidence checks and confidence scoring
+  context.ts               per-batch reference context (overview, guidance, usages)
+  difflines.ts             diff line maps and inline comment anchoring
+  attach-replies.ts        attach per-finding PR reply commands to fix-brief.md
+scripts/                   local CLIs and Action helpers
+  review-pr.sh             run against an existing PR from your machine
+  review-pr.ps1            PowerShell equivalent
+  compute-diffs.sh         review diff + GitHub PR anchor diff for Actions
+  calibrate.ts             calibration harness for confidence thresholds
+test/                      unit tests (one file per module)
+  e2e/                     process-level engine and context tests
+examples/fixbrief-ai.yml   workflow that uses the action
 .env.example               config template for local runs
 ```
 
@@ -48,10 +56,11 @@ scripts/review-pr.sh 123 --repo OWNER/NAME --post
 scripts/review-pr.sh 123 --repo OWNER/NAME --provider anthropic --model <model-name>
 ```
 
-Output goes to `./reviewbrief-out/pr-123/`: `review.md`, `fix-brief.md` (if anything was actionable), and the raw `pr.diff`.
+Output goes to `./fixbrief-ai-out/pr-123/`: `review.md`, `fix-brief.md` (if anything was actionable), and the raw `pr.diff`.
 The renderer also writes `review-payload.json` (confidence-filtered inline GitHub review comments) and `findings.json` (every scored finding with its confidence breakdown).
 
 Notes:
+
 - Inside a clone of the repo you can omit `--repo`.
 - `gh pr diff` is limited by GitHub's API (about 300 files). If it fails and you're inside a clone whose `origin` is that repo, the script falls back to a local `git diff` automatically.
 - Variables already exported in your shell win over `.env`.
@@ -59,16 +68,15 @@ Notes:
 You can also call the engine directly on any diff:
 
 ```bash
-git diff main...HEAD | node --experimental-strip-types scripts/reviewbrief.ts --out-dir out
-node --experimental-strip-types scripts/reviewbrief.ts --diff my.diff --dry-run
+git diff main...HEAD | node --experimental-strip-types src/fixbrief-ai.ts --out-dir out
+node --experimental-strip-types src/fixbrief-ai.ts --diff my.diff --dry-run
 ```
 
 ---
 
 ## 2. Run it on every PR (GitHub Actions)
 
-1. Put this folder in a public (or private) repo, e.g. `kadraman/reviewbrief`, and tag a release (`v1`).
-2. In the repo you want reviewed, add **Settings → Secrets and variables → Actions**:
+1. In the repo you want reviewed, add **Settings → Secrets and variables → Actions**:
 
    | Name | Type | Notes |
    |---|---|---|
@@ -76,12 +84,9 @@ node --experimental-strip-types scripts/reviewbrief.ts --diff my.diff --dry-run
    | `LLM_MODEL` | Variable | required; recommended default `gpt-5-mini` |
    | `LLM_PROVIDER` | Variable | `openai` (default) or `anthropic` |
    | `LLM_BASE_URL` | Variable | leave unset for OpenAI; set for DeepSeek/OpenRouter/etc. |
+2. Copy `examples/fixbrief-ai.yml` to `.github/workflows/fixbrief-ai.yml` and replace `kadraman/fixbrief-ai@v1` with your action reference.
 
-3. Copy `examples/reviewbrief.yml` to `.github/workflows/reviewbrief.yml` and replace `kadraman/reviewbrief@v1` with your action reference.
-
-Use `actions/checkout` with `fetch-depth: 0` (the example does) so very large diffs aren't limited by GitHub's API, synchronize can resolve `github.event.before`, and diffs are computed against the PR head SHA rather than the synthetic merge commit.
-
-To test the action inside this repo before publishing, use `uses: ./` in a workflow here.
+Use `actions/checkout` with `fetch-depth: 0` (as in the example) so very large diffs aren't limited by GitHub's API, synchronize can resolve `github.event.before`, and diffs are computed against the PR head SHA rather than the synthetic merge commit.
 
 ### Provider examples
 
@@ -133,7 +138,7 @@ The PR comment links to the `fix-brief.md` artifact (kept 14 days). Download it,
 claude -p "$(cat fix-brief.md)"
 ```
 
-or paste/attach it in Copilot, Cursor, or a chat session. The brief tells the assistant to verify each finding first, keep changes minimal, run the tests, and **comment on the pull request for every finding** (what it fixed, or why it skipped it). When ReviewBrief could post an inline thread, the brief includes a `gh` reply command for that comment; otherwise it falls back to a new PR comment. The findings come from an LLM reading diffs in separate batches, so **read the brief before running it** and review the resulting changes like any other PR.
+or paste/attach it in Copilot, Cursor, or a chat session. The brief tells the assistant to verify each finding first, keep changes minimal, run the tests, and **comment on the pull request for every finding** (what it fixed, or why it skipped it). When FixBrief AI could post an inline thread, the brief includes a `gh` reply command for that comment; otherwise it falls back to a new PR comment. The findings come from an LLM reading diffs in separate batches, so **read the brief before running it** and review the resulting changes like any other PR.
 
 ---
 
@@ -147,7 +152,7 @@ or paste/attach it in Copilot, Cursor, or a chat session. The brief tells the as
 
 ### What gets posted, and when
 
-- **Opened / reopened:** ReviewBrief reviews the full PR diff (`origin/<base>...<PR head SHA>`) and posts a gated PR review (or a one-line empty-gate note when nothing qualifies). Diffs use the PR head commit, not the synthetic merge `HEAD` that `actions/checkout` lands on for `pull_request` events.
+- **Opened / reopened:** FixBrief AI reviews the full PR diff (`origin/<base>...<PR head SHA>`) and posts a gated PR review (or a one-line empty-gate note when nothing qualifies). Diffs use the PR head commit, not the synthetic merge `HEAD` that `actions/checkout` lands on for `pull_request` events.
 - **Synchronize (new commits):** it reviews only the new commits (`before...<PR head SHA>`) when that prior SHA is still an ancestor of the new head. Force-push, rebase, or a missing previous head falls back to the full PR diff. The model sees `diff-context-lines` of context; inline comments are anchored to GitHub's own PR diff. If the incremental review finds nothing that meets the publish gate, **no new comment is posted**, so the earlier review stays in place.
 - The review footer names the range (`Reviewed changes since <sha>` vs the full PR) so a partial review is obvious.
 - `create-review` failures fall back to an issue comment built from the gated payload — never the ungated `review.md` dump.
@@ -163,12 +168,6 @@ Limitations: batches are reviewed independently, so problems that span files in 
 - PR title/body are passed through environment variables, never interpolated into shell code, and the model is told the diff and reference context (project docs, code at usage sites) are untrusted data. A determined prompt injection can still skew a review, so treat output as advice.
 - Pin the action to a release tag or commit SHA in your workflow.
 - Keep `.env` out of git (it's in `.gitignore`).
-
----
-
-## Publishing to the GitHub Marketplace
-
-Requirements are roughly: a public repo with `action.yml` in the root, a unique action name, two-factor auth on your account, and acceptance of the Marketplace Developer Agreement. Before choosing a name, search the Marketplace, check that no GitHub user/org has it, and search the web for existing products. Then edit `author:` in `action.yml`, add a LICENSE, create a release, and tick "Publish this Action to the GitHub Marketplace".
 
 ---
 

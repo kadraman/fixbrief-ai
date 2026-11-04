@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Run reviewbrief against an existing pull request from your own machine.
+  Run fixbrief-ai against an existing pull request from your own machine.
   Nothing is posted to GitHub unless you pass -Post.
 
 .EXAMPLE
@@ -38,7 +38,7 @@ Options:
   -Repo OWNER/NAME     repository (not needed inside a clone, or with a PR URL)
   -DryRun              show how the diff would be split; make no LLM calls
   -Post                post the review as a comment on the PR
-  -Out DIR             output directory (default: .\reviewbrief-out\pr-<N>)
+  -Out DIR             output directory (default: .\fixbrief-ai-out\pr-<N>)
   -Provider NAME       openai | anthropic   (overrides LLM_PROVIDER)
   -Model NAME          model name           (overrides LLM_MODEL)
   -BaseUrl URL         API root             (overrides LLM_BASE_URL)
@@ -148,7 +148,7 @@ if (-not $Repo) {
   if ($Url -match 'https?://[^/]+/([^/]+/[^/]+)/pull/') { $Repo = $Matches[1] }
 }
 
-if (-not $Out) { $Out = Join-Path (Get-Location) "reviewbrief-out\pr-$PR" }
+if (-not $Out) { $Out = Join-Path (Get-Location) "fixbrief-ai-out\pr-$PR" }
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 Write-Host "  $Repo #${PR}: $Title"
@@ -182,11 +182,11 @@ if (-not $diffOk) {
   git rev-parse --git-dir 1>$null 2>$null
   if ($LASTEXITCODE -eq 0) {
     Write-Host "  falling back to a local git diff (needs 'origin' to be this repo) ..."
-    & git fetch --quiet origin "pull/$PR/head:refs/reviewbrief/pr-$PR"
+    & git fetch --quiet origin "pull/$PR/head:refs/fixbrief-ai/pr-$PR"
     if ($LASTEXITCODE -ne 0) { Die "git fetch of the PR head failed" }
     & git fetch --quiet origin $Base
     if ($LASTEXITCODE -ne 0) { Die "git fetch of base branch '$Base' failed" }
-    $diffText = & git diff --no-color "origin/$Base...refs/reviewbrief/pr-$PR" | Out-String
+    $diffText = & git diff --no-color "origin/$Base...refs/fixbrief-ai/pr-$PR" | Out-String
     [System.IO.File]::WriteAllText($diffPath, $diffText)
   } else {
     Die "could not fetch the diff; run this inside a clone of $Repo to enable the git fallback"
@@ -197,7 +197,7 @@ $diffBytes = (Get-Item -LiteralPath $diffPath).Length
 Write-Host "  diff: $diffBytes bytes"
 
 $nodeArgs = @(
-  "--experimental-strip-types", (Join-Path $Here "reviewbrief.ts"),
+  "--experimental-strip-types", (Join-Path $Root "src\fixbrief-ai.ts"),
   "--diff", $diffPath, "--out-dir", $Out,
   "--title", $Title, "--body", $Body, "--pr", $PR, "--repo", $Repo, "--head", $Head, "--base", $Base
 )

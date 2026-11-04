@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Run reviewbrief against an existing pull request from your own machine.
+# Run fixbrief-ai against an existing pull request from your own machine.
 # Nothing is posted to GitHub unless you pass --post.
 #
 # Usage:
@@ -11,7 +11,7 @@
 #   --dry-run             show how the diff would be split; make no LLM calls
 #   --post                post the review as a PR review; uploads fix-brief.md as a
 #                         secret gist and links it from the review body when present
-#   --out DIR             output directory (default: ./reviewbrief-out/pr-<N>)
+#   --out DIR             output directory (default: ./fixbrief-ai-out/pr-<N>)
 #   --provider NAME       openai | anthropic   (overrides LLM_PROVIDER)
 #   --model NAME          model name           (overrides LLM_MODEL)
 #   --base-url URL        API root             (overrides LLM_BASE_URL)
@@ -98,7 +98,7 @@ BASE="$(meta_get baseRefName)"
 URL="$(meta_get url)"
 [ -n "$REPO" ] || REPO="$(printf '%s' "$URL" | sed -E 's#https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#')"
 
-OUT="${OUT:-$PWD/reviewbrief-out/pr-$PR}"
+OUT="${OUT:-$PWD/fixbrief-ai-out/pr-$PR}"
 mkdir -p "$OUT"
 
 echo "  $REPO #$PR: $TITLE"
@@ -110,10 +110,10 @@ if ! gh pr diff "$PR" ${GH_REPO[@]+"${GH_REPO[@]}"} > "$OUT/pr.diff" 2> "$OUT/gh
   echo "  gh pr diff failed: $(head -c 200 "$OUT/gh-diff.err")"
   if git rev-parse --git-dir >/dev/null 2>&1; then
     echo "  falling back to a local git diff (needs 'origin' to be this repo) ..."
-    git fetch --quiet origin "pull/$PR/head:refs/reviewbrief/pr-$PR" \
+    git fetch --quiet origin "pull/$PR/head:refs/fixbrief-ai/pr-$PR" \
       || die "git fetch of the PR head failed"
     git fetch --quiet origin "$BASE" || die "git fetch of base branch '$BASE' failed"
-    git diff --no-color "origin/$BASE...refs/reviewbrief/pr-$PR" > "$OUT/pr.diff"
+    git diff --no-color "origin/$BASE...refs/fixbrief-ai/pr-$PR" > "$OUT/pr.diff"
   else
     die "could not fetch the diff; run this inside a clone of $REPO to enable the git fallback"
   fi
@@ -126,7 +126,7 @@ ARGS=(--diff "$OUT/pr.diff" --out-dir "$OUT"
 
 echo
 rc=0
-node --experimental-strip-types "$HERE/reviewbrief.ts" "${ARGS[@]}" || rc=$?
+node --experimental-strip-types "$ROOT/src/fixbrief-ai.ts" "${ARGS[@]}" || rc=$?
 [ "$rc" -eq 0 ] || die "review failed (exit $rc); see output above"
 
 if [ "$DRY" -eq 1 ]; then
@@ -184,7 +184,7 @@ if [ "$POST" -eq 1 ]; then
   fi
 
   if [ -f "$OUT/fix-brief.md" ] && [ -f "$OUT/fix-brief-targets.json" ]; then
-    node --experimental-strip-types "$HERE/attach-replies.ts" \
+    node --experimental-strip-types "$ROOT/src/attach-replies.ts" \
       --brief "$OUT/fix-brief.md" --targets "$OUT/fix-brief-targets.json" \
       --comments "$OUT/posted-comments.json"
   fi
@@ -192,11 +192,11 @@ if [ "$POST" -eq 1 ]; then
   # Secret gists are unlisted but reachable by anyone with the URL (same as artifact links).
   if [ -f "$OUT/fix-brief.md" ]; then
     echo "Uploading fix-brief.md as a secret gist..."
-    BRIEF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/reviewbrief-gist.XXXXXX")" || die "mktemp failed"
+    BRIEF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fixbrief-ai-gist.XXXXXX")" || die "mktemp failed"
     BRIEF_COPY="$BRIEF_DIR/fix-brief-pr-${PR}.md"
     cp "$OUT/fix-brief.md" "$BRIEF_COPY"
     GIST_OUT="$(gh gist create \
-      --desc "ReviewBrief fix brief for ${REPO} PR #${PR}" \
+      --desc "FixBrief AI fix brief for ${REPO} PR #${PR}" \
       "$BRIEF_COPY")" \
       || { rm -rf "$BRIEF_DIR"; die "failed to create gist for fix-brief.md"; }
     rm -rf "$BRIEF_DIR"
@@ -221,7 +221,7 @@ if [ "$POST" -eq 1 ]; then
 else
   if [ -f "$OUT/fix-brief.md" ] && [ -f "$OUT/fix-brief-targets.json" ]; then
     echo "[]" > "$OUT/posted-comments.json"
-    node --experimental-strip-types "$HERE/attach-replies.ts" \
+    node --experimental-strip-types "$ROOT/src/attach-replies.ts" \
       --brief "$OUT/fix-brief.md" --targets "$OUT/fix-brief-targets.json" \
       --comments "$OUT/posted-comments.json"
   fi
