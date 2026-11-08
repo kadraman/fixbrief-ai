@@ -9,6 +9,7 @@
 #   Variable  LLM_BASE_URL   (optional; leave unset for OpenAI)
 # Optional Variables (passed through when set):
 #   LLM_MAX_OUTPUT_TOKENS, LLM_THINKING, LLM_REQUEST_TIMEOUT_MS
+# findings.json is always uploaded by the action; set debug-artifacts: true for extras.
 
 name: FixBrief AI
 

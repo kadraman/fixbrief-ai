@@ -550,7 +550,7 @@ export function reviewOverviewBody(
     );
     if (belowGateCount > 0) {
       parts.push(
-        `_${belowGateCount} other finding${belowGateCount === 1 ? " was" : "s were"} scored but stayed below the publish gate (see \`findings.json\` / the job summary)._`,
+        `_${belowGateCount} other finding${belowGateCount === 1 ? " was" : "s were"} scored but stayed below the publish gate (see the workflow job summary or the \`findings.json\` artifact)._`,
         "",
       );
     }
@@ -628,7 +628,7 @@ export function hasMultiRunAgreement(finding: Finding): boolean {
  * Whether a scored finding is eligible for an inline GitHub review comment.
  * Calibrated against beatbax: only critical/high above the confidence floor post inline;
  * medium findings that clear the fix-brief floor are summarised in the overview instead,
- * and low/info stay in findings.json / the job summary.
+ * and low/info stay in the job summary / findings.json artifact.
  * Agreement across consistency runs adjusts the confidence score; it does not hide
  * critical/high findings that already clear the floor (one-off highs still publish).
  * `requireMultiRun` is accepted for call-site compatibility and is unused here.
@@ -676,7 +676,7 @@ export const FIX_BRIEF_MEDIUM_CONFIDENCE = 0.75;
  * Whether a scored finding belongs in fix-brief.md.
  * Always includes the PR publish set (critical/high ≥ minimumConfidence), including one-offs.
  * Also includes medium severity at or above fixBriefMediumConfidence (default 0.75).
- * Low/info stay out of the brief (job summary / findings.json only).
+ * Low/info stay out of the brief (job summary / findings.json artifact only).
  * When requireMultiRun is set, one-off *medium* findings stay out of the brief.
  */
 export function qualifiesForFixBrief(
