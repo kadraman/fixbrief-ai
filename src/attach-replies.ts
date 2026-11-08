@@ -151,11 +151,19 @@ export function attachReportBack(options: ReportBackOptions): string {
   return brief;
 }
 
-/** Append the fix-brief download link to a review overview body. */
+/** Markdown block linking the fix brief and telling a human how to use it. */
+export function briefDownloadBlock(url: string): string {
+  return [
+    `**Fix brief for an AI assistant:** [download fix-brief.md](${url})`,
+    "",
+    "Download `fix-brief.md`, check out this pull request's branch, and give the file to a coding assistant (Cursor, Copilot, Claude Code, or similar). It lists each finding to verify before changing code, the smallest fix, and how to comment back on this pull request.",
+  ].join("\n");
+}
+
+/** Append the fix-brief download link (and usage instructions) to a review overview body. */
 export function appendBriefDownloadLink(body: string, url: string): string {
-  const line = `**Fix brief for an AI assistant:** [download fix-brief.md](${url})`;
-  if (body.includes(line) || body.includes(`[download fix-brief.md](${url})`)) return body;
-  return `${body.trimEnd()}\n\n${line}\n`;
+  if (body.includes(`[download fix-brief.md](${url})`)) return body;
+  return `${body.trimEnd()}\n\n${briefDownloadBlock(url)}\n`;
 }
 
 function readJson<T>(path: string): T {

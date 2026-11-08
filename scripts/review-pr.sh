@@ -206,13 +206,14 @@ if [ "$POST" -eq 1 ]; then
     echo "Fix brief gist: $BRIEF_URL"
     if [ -n "$REVIEW_ID" ]; then
       PATCH="$OUT/review-body-patch.json"
-      node --input-type=module -e '
+      node --experimental-strip-types --input-type=module -e '
         import { readFileSync, writeFileSync } from "node:fs";
+        import { pathToFileURL } from "node:url";
+        const { appendBriefDownloadLink } = await import(pathToFileURL(process.argv[4]).href);
         const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-        const url = process.argv[2];
-        const line = `**Fix brief for an AI assistant:** [download fix-brief.md](${url})`;
-        writeFileSync(process.argv[3], JSON.stringify({ body: `${payload.body.trimEnd()}\n\n${line}\n` }));
-      ' "$OUT/review-payload.json" "$BRIEF_URL" "$PATCH"
+        const body = appendBriefDownloadLink(payload.body, process.argv[2]);
+        writeFileSync(process.argv[3], JSON.stringify({ body }));
+      ' "$OUT/review-payload.json" "$BRIEF_URL" "$PATCH" "$ROOT/src/attach-replies.ts"
       gh api --method PUT "repos/$REPO/pulls/$PR/reviews/$REVIEW_ID" --input "$PATCH" >/dev/null \
         || echo "warning: could not patch review body with fix-brief link"
     fi

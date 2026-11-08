@@ -50,9 +50,13 @@ inputs:
     required: false
     default: "3"
   minimum-confidence:
-    description: Confidence floor for published findings (0..1). Only severity critical or high at or above this floor appear on the PR (medium/low/info stay in the job summary).
+    description: Confidence floor for inline comments (0..1). Only severity critical or high at or above this floor post inline. Fix-brief medium findings are summarised in the overview; weaker findings stay in the job summary.
     required: false
     default: "0.85"
+  categories:
+    description: "Comma-separated finding categories to keep (security, quality, maintainability, performance, architecture, testing, documentation, compliance), or 'all'. Style/lint nits stay out of scope."
+    required: false
+    default: "all"
   max-inline-comments:
     description: Optional cap on inline review comments; 0 means no cap.
     required: false
@@ -78,7 +82,7 @@ inputs:
     required: false
     default: "12000"
   debug-artifacts:
-    description: "true to upload findings.json and review-payload.json (they contain code excerpts)."
+    description: "true to upload findings.json, review-payload.json, fix-brief-targets.json, and scope.txt (they contain code excerpts — keep off unless you need them)."
     required: false
     default: "false"
 
@@ -139,6 +143,7 @@ runs:
         MAX_BATCHES: ${{ inputs.max-batches }}
         WORKERS: ${{ inputs.workers }}
         MINIMUM_CONFIDENCE: ${{ inputs.minimum-confidence }}
+        CATEGORIES: ${{ inputs.categories }}
         MAX_INLINE_COMMENTS: ${{ inputs.max-inline-comments }}
         FIX_BRIEF: ${{ inputs.fix-brief }}
         ANCHOR_DIFF_FILE: ${{ runner.temp }}/fixbrief-ai/anchor.diff
@@ -209,7 +214,7 @@ runs:
           import { readFileSync } from "node:fs";
           const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
           const has = payload.comments.length > 0
-            || /### Could not place inline|### Over the inline cap/.test(payload.body || "");
+            || /### Could not place inline|### Over the inline cap|### Also in the fix brief/.test(payload.body || "");
           console.log(has ? "yes" : "no");
         ' "$REVIEW_PAYLOAD")"
         INLINE_COUNT="$(node --input-type=module -e '
@@ -294,6 +299,7 @@ runs:
       if: steps.review.outputs.has_brief == 'true' && steps.post.outputs.posted == 'true' && steps.post.outputs.review_id != ''
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.github-token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
@@ -307,14 +313,14 @@ runs:
           exit 0
         fi
         PATCH="$RUNNER_TEMP/fixbrief-ai/review-body-patch.json"
-        node --input-type=module -e '
+        node --experimental-strip-types --input-type=module -e '
           import { readFileSync, writeFileSync } from "node:fs";
+          import { pathToFileURL } from "node:url";
+          const { appendBriefDownloadLink } = await import(pathToFileURL(process.argv[4]).href);
           const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-          const url = process.argv[2];
-          const line = `**Fix brief for an AI assistant:** [download fix-brief.md](${url})`;
-          const body = `${payload.body.trimEnd()}\n\n${line}\n`;
+          const body = appendBriefDownloadLink(payload.body, process.argv[2]);
           writeFileSync(process.argv[3], JSON.stringify({ body }));
-        ' "$REVIEW_PAYLOAD" "$BRIEF_URL" "$PATCH"
+        ' "$REVIEW_PAYLOAD" "$BRIEF_URL" "$PATCH" "$ACTION_PATH/src/attach-replies.ts"
         gh api --method PUT "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --input "$PATCH" >/dev/null
         echo "Patched review $REVIEW_ID with fix-brief download link."
 

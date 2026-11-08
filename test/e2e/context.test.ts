@@ -6,6 +6,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { engineTestEnv } from "./env.ts";
 
 const ENGINE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src", "fixbrief-ai.ts");
 
@@ -39,8 +40,10 @@ function runEngine(baseUrl: string, cwd: string, args: string[], extraEnv: Recor
   return new Promise((resolve, reoect) => {
     const child = spawn(process.execPath, ["--experimental-strip-types", ENGINE, ...args, "--no-fix-brief"], {
       cwd,
-      env: { ...process.env, LLM_API_KEY: "k", LLM_MODEL: "m", LLM_PROVIDER: "openai", LLM_BASE_URL: baseUrl, LLM_RETRY_DELAY: "0",
-        WORKERS: "1", FIX_BRIEF: "false", LLM_TEMPERATURE: "", CONSISTENCY_RUNS: "", CONTEXT_CHARS: "", ...extraEnv },
+      env: engineTestEnv({
+        LLM_API_KEY: "k", LLM_MODEL: "m", LLM_PROVIDER: "openai", LLM_BASE_URL: baseUrl, LLM_RETRY_DELAY: "0",
+        WORKERS: "1", FIX_BRIEF: "false", LLM_TEMPERATURE: "", CONSISTENCY_RUNS: "", CONTEXT_CHARS: "", ...extraEnv,
+      }),
       windowsHide: true,
     });
     let stdout = "", stderr = "";
@@ -179,7 +182,11 @@ test("e2e: failed batches are reported in batch order, not completion order", as
       assert.equal(r.code, 0, r.stderr);
       const files = (findingsJson(dir).failedBatches as string[]).map((label) => label.replace(/ \(part \d+\/\d+\)$/, ""));
       assert.deepEqual(files, ["two.py", "three.py"]);
-      assert.match(readFileSync(join(dir, "out", "review.md"), "utf8"), /two\.py[^,\n]*, three\.py/);
+      const review = readFileSync(join(dir, "out", "review.md"), "utf8");
+      assert.match(review, /Show not reviewed files/);
+      assert.match(review, /`two\.py`/);
+      assert.match(review, /`three\.py`/);
+      assert.ok(review.indexOf("`two.py`") < review.indexOf("`three.py`"));
     });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -190,7 +197,7 @@ test("e2e: --diff - and --anchor-diff - reuse stdin once (no second read of fd 0
   try {
     const result = await new Promise<{ code: number; stderr: string }>((resolve, reoect) => {
       const child = spawn(process.execPath, ["--experimental-strip-types", ENGINE, "--diff", "-", "--anchor-diff", "-", "--out-dir", "out", "--dry-run"], {
-        cwd: dir, env: { ...process.env, LLM_API_KEY: "k", LLM_MODEL: "m", LLM_PROVIDER: "openai" }, windowsHide: true,
+        cwd: dir, env: engineTestEnv({ LLM_API_KEY: "k", LLM_MODEL: "m", LLM_PROVIDER: "openai" }), windowsHide: true,
       });
       let stderr = "";
       child.stderr.on("data", (d) => { stderr += d; });

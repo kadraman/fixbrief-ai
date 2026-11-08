@@ -2,8 +2,8 @@
 
 AI-powered pull request review for GitHub that works with **any model** (OpenAI, Claude, DeepSeek, OpenRouter, Ollama, anything OpenAI-compatible), **doesn't truncate large PRs**, and writes a **fix brief**: a markdown prompt you can hand to an AI coding assistant to apply the fixes.
 
-- **Large PRs:** the diff is split per file (and per hunk for huge files), reviewed in batches, then merged into one review. Skipped files and failed batches are listed in the comment, never silently dropped.
-- **Structured findings:** the model returns canonical Findings, which FixBrief AI renders into Copilot-style overview, inline comments and suggestions.
+- **Large PRs:** the diff is split per file (and per hunk for huge files), reviewed in batches, then merged into one review. Skipped files and failed batches are summarised with a collapsible file list in the comment, never silently dropped.
+- **Structured findings:** the model returns canonical Findings (with categories you can allowlist), which FixBrief AI renders into Copilot-style overview, inline comments and suggestions.
 - **Any provider:** two protocols cover nearly everything: `openai` (OpenAI-compatible) and `anthropic`.
 - **Fix brief:** creates a `fix-brief.md` that lists each actionable finding with file, problem, suggested fix and a "done when" check, plus rules that tell the assistant to verify each finding before changing anything.
 - **TypeScript runtime:** the review pipeline, canonical Finding model, and renderers run on Node.js 22 without third-party packages.
@@ -57,7 +57,7 @@ scripts/review-pr.sh 123 --repo OWNER/NAME --provider anthropic --model <model-n
 ```
 
 Output goes to `./fixbrief-ai-out/pr-123/`: `review.md`, `fix-brief.md` (if anything was actionable), and the raw `pr.diff`.
-The renderer also writes `review-payload.json` (confidence-filtered inline GitHub review comments) and `findings.json` (every scored finding with its confidence breakdown).
+The renderer also writes `review-payload.json` (confidence-filtered inline GitHub review comments) and `findings.json` (every scored finding with its confidence breakdown). Those files stay on the runner unless you set `debug-artifacts: true` (they contain code excerpts).
 
 Notes:
 
@@ -114,7 +114,8 @@ Use `actions/checkout` with `fetch-depth: 0` (as in the example) so very large d
 | `batch-chars` | `100000` | max diff characters packed per API call (~25k tokens); lower it for small-context models |
 | `piece-chars` | `20000` | max characters per file piece before hunk-splitting; large files are split even when under `batch-chars` |
 | `max-batches` | `40` | cost guard; extra batches are listed as "not reviewed" |
-| `minimum-confidence` | `0.85` | confidence floor for published findings; only severity `critical` or `high` at or above this floor appear on the PR (`medium`/`low`/`info` stay in the job summary / `findings.json`) |
+| `minimum-confidence` | `0.85` | confidence floor for inline comments; only severity `critical` or `high` at or above this floor post inline. Fix-brief medium findings (≥ `0.75`) are summarised in the overview; weaker findings stay in the workflow job summary |
+| `categories` | `all` | comma-separated finding categories to keep (`security`, `quality`, `maintainability`, `performance`, `architecture`, `testing`, `documentation`, `compliance`), or `all`. Applied in the prompt and again as a hard filter after scoring. Style / formatting / lint nits stay out of scope regardless |
 | `max-inline-comments` | `0` (all) | optional cap on inline comments; `0` means no cap; overflow still appears in the overview under “Over the inline cap” |
 | `workers` | `3` | parallel API calls |
 | `fix-brief` | `true` | also produce `fix-brief.md` (PR-gated findings plus medium severity at ≥ `0.75`; override with env `FIX_BRIEF_MEDIUM_CONFIDENCE`) |
@@ -122,7 +123,7 @@ Use `actions/checkout` with `fetch-depth: 0` (as in the example) so very large d
 | `github-token` | `github.token` | needs `pull-requests: write` |
 | `diff-context-lines` | `10` | lines of context around each change in the diff the model reads (GitHub's own diff has 3; inline comments are still anchored to that PR diff) |
 | `context-chars` | `12000` | cap for the reference context (PR file overview, project guidance, other usages of changed symbols) added to each review call; `0` turns it off |
-| `debug-artifacts` | `false` | when `true`, upload `findings.json`, `review-payload.json`, and `scope.txt` (they contain code excerpts) |
+| `debug-artifacts` | `false` | when `true`, upload `findings.json`, `review-payload.json`, `fix-brief-targets.json`, and `scope.txt` (they contain code excerpts — leave off by default) |
 
 Engine-only environment variables (optional, for local runs or advanced tuning): `CONTEXT_CALLERS` (usages shown per changed symbol, default `3`), `CONTEXT_SYMBOLS` (symbols looked up per batch, default `12`), `CONTEXT_DOC_CHARS` (cap for the project-guidance excerpt, default `3000`).
 
@@ -130,9 +131,38 @@ Outputs: `review-path`, `fix-brief-path`, `fix-brief-url`.
 
 ---
 
+## Finding categories
+
+Every finding has one category. You can limit which ones FixBrief AI keeps with the `categories` input (or `CATEGORIES` / `--categories`):
+
+| Category | Meaning |
+|---|---|
+| `security` | Exploitable or clearly unsafe behaviour |
+| `compliance` | Diff violates a named security/policy standard or a hard project/org must-rule (OWASP-class controls, license/privacy handling, forbidden CI patterns). **Not** style guides |
+| `quality` | Concrete correctness / robustness bugs that are not primarily security or policy |
+| `maintainability` | Structural problems with a real failure mode (not “might confuse” taste) |
+| `performance` | Clear hot-path or resource regressions with evidence in the diff |
+| `architecture` | Broken boundaries or contracts across modules |
+| `testing` | Missing or broken tests that leave a real defect unguarded |
+| `documentation` | Docs that are factually wrong about behaviour the diff changes |
+
+**Out of scope on purpose:** formatting, naming, import order, TypeScript typing nits, and other style-guide adherence. Those belong to ESLint, Prettier, Semgrep, Fortify, and similar tools — FixBrief AI will not review them even when `categories` includes `compliance` or `quality`.
+
+Examples:
+
+```yaml
+# Security and policy only
+with:
+  categories: security,compliance
+
+# Default — every category above
+with:
+  categories: all
+```
+
 ## Using the fix brief
 
-The PR comment links to the `fix-brief.md` artifact (kept 14 days). Download it, check out the PR branch, and give it to your assistant. For example, with Claude Code:
+The PR review links to the `fix-brief.md` artifact (kept 14 days) and includes a short how-to. Download it, check out the PR branch, and give it to your assistant. For example, with Claude Code:
 
 ```bash
 claude -p "$(cat fix-brief.md)"
@@ -148,7 +178,7 @@ or paste/attach it in Copilot, Cursor, or a chat session. The brief tells the as
 2. A file larger than `piece-chars` (capped by `batch-chars`) is split on hunk boundaries (and on line boundaries inside giant hunks); every part keeps the file header. Split parts are reviewed alone so they are not packed back into one oversized call.
 3. Other pieces are packed into batches up to `batch-chars`.
 4. Each batch is reviewed in its own call (retrying 429/5xx/529 with backoff). If the model still returns invalid JSON (or the request fails), the batch is split further and retried up to two times. Every batch also gets a bounded **reference context** block: a list of files in the PR, the first project-guidance file found (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or `CONTRIBUTING.md`), and other usages of symbols declared on changed lines (`git grep` in the checkout). Findings must still be on changed lines in the diff; reference line numbers are approximate.
-5. Each response is parsed into the canonical Finding schema. Confidence is computed in code from the model's high/medium/low level plus checked evidence (and agreement across consistency runs). By default the review runs twice (`consistency-runs: 2`); findings are clustered across runs and agreement adjusts the score (±0.10). Findings are then gated to severity `critical`/`high` at or above `minimum-confidence` — including one-offs (a single-run high can still post). Those are posted as inline review comments when the line is on **GitHub's PR diff** (the anchor diff), otherwise under “Could not place inline” / “Over the inline cap”. Medium and below stay off the PR (job summary / `findings.json`). An empty-gate overview notes how many scored findings stayed below the gate. The fix brief includes the PR-gated set **plus** multi-run medium findings scored ≥ `0.75` (env `FIX_BRIEF_MEDIUM_CONFIDENCE`). Low/info and one-off medium findings stay out of the brief. The prompt asks the model to skip style, typing, and docs nits so fewer low-value findings are emitted.
+5. Each response is parsed into the canonical Finding schema. Confidence is computed in code from the model's high/medium/low level plus checked evidence (and agreement across consistency runs). By default the review runs twice (`consistency-runs: 2`); findings are clustered across runs and agreement adjusts the score (±0.10). Findings are then gated to severity `critical`/`high` at or above `minimum-confidence` — including one-offs (a single-run high can still post). Those are posted as inline review comments when the line is on **GitHub's PR diff** (the anchor diff), otherwise under “Could not place inline” / “Over the inline cap”. Medium findings that clear the fix-brief floor (≥ `0.75`, env `FIX_BRIEF_MEDIUM_CONFIDENCE`) are summarised under “Also in the fix brief” in the overview (and included in `fix-brief.md`); they are not posted as inline comments. Low/info and weaker medium findings stay in the workflow job summary only (or in `findings.json` when `debug-artifacts` is on). An empty-gate overview notes how many scored findings stayed below the gate and points at the job summary. The fix brief includes the PR-gated set **plus** multi-run medium findings scored ≥ `0.75`. Low/info and one-off medium findings stay out of the brief. The prompt asks the model to skip style, typing, and docs nits so fewer low-value findings are emitted.
 
 ### What gets posted, and when
 

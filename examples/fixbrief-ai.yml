@@ -12,7 +12,8 @@
 # it stays silent so the earlier review remains. Inline comments are anchored
 # to GitHub's PR diff even when the model sees extra context lines.
 # Default consistency-runs is 2: agreement adjusts confidence; critical/high that
-# clear the floor still publish as one-offs.
+# clear the floor still publish as one-offs. Set debug-artifacts: true only when
+# you need findings.json / review-payload.json (they contain code excerpts).
 
 name: FixBrief AI - PR Review
 
@@ -42,3 +43,5 @@ jobs:
           model: ${{ vars.LLM_MODEL }}
           provider: ${{ vars.LLM_PROVIDER || 'openai' }}
           base-url: ${{ vars.LLM_BASE_URL }}
+          # Optional: limit categories (default all). Style/lint nits stay out of scope.
+          # categories: security,compliance,quality

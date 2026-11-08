@@ -1,9 +1,16 @@
 #!/usr/bin/env node
 /** Canonical Finding model and GitHub review comment renderer. */
 
-export type FindingCategory =
-  | "security" | "quality" | "maintainability" | "performance"
-  | "architecture" | "testing" | "documentation" | "compliance";
+/** Canonical finding categories. Style / formatting / lint nits are out of scope. */
+export const FINDING_CATEGORIES = [
+  "security", "quality", "maintainability", "performance",
+  "architecture", "testing", "documentation", "compliance",
+] as const;
+
+export type FindingCategory = (typeof FINDING_CATEGORIES)[number];
+
+/** Allowlist of categories, or `"all"` for every category. */
+export type CategoryFilter = Set<FindingCategory> | "all";
 
 export type ConfidenceLevel = "high" | "medium" | "low";
 export type EvidenceStatus = "found" | "partial" | "not_found" | "missing";
@@ -54,12 +61,48 @@ export interface GitHubReviewPayload {
   comments: GitHubReviewComment[];
 }
 
-const CATEGORIES = new Set(["security", "quality", "maintainability", "performance", "architecture", "testing", "documentation", "compliance"]);
+const CATEGORIES = new Set<string>(FINDING_CATEGORIES);
 const SEVERITIES = new Set(["critical", "high", "medium", "low", "info"]);
 const severities: FindingSeverity[] = ["critical", "high", "medium", "low", "info"];
 const icons: Record<FindingSeverity, string> = {
   critical: "🚨", high: "⚠️", medium: "🔶", low: "💡", info: "ℹ️",
 };
+
+/**
+ * Parse a comma/space-separated category allowlist.
+ * Empty, `all`, or `*` means every category. Unknown names throw.
+ */
+export function parseCategories(raw: string): CategoryFilter {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.toLowerCase() === "all" || trimmed === "*") return "all";
+  const parts = trimmed.split(/[,|\s]+/).map((part) => part.trim().toLowerCase()).filter(Boolean);
+  const allowed = new Set<FindingCategory>();
+  const unknown: string[] = [];
+  for (const part of parts) {
+    if (CATEGORIES.has(part)) allowed.add(part as FindingCategory);
+    else unknown.push(part);
+  }
+  if (unknown.length) {
+    throw new Error(
+      `Unknown categor${unknown.length === 1 ? "y" : "ies"}: ${unknown.join(", ")}. `
+      + `Valid: ${FINDING_CATEGORIES.join(", ")} (or all).`,
+    );
+  }
+  if (!allowed.size) throw new Error("CATEGORIES resolved to an empty allowlist");
+  return allowed;
+}
+
+/** Drop findings whose category is outside the allowlist. */
+export function filterByCategories(findings: Finding[], categories: CategoryFilter): Finding[] {
+  if (categories === "all") return findings;
+  return findings.filter((finding) => categories.has(finding.category));
+}
+
+/** Stable label for logs / findings.json (`all` or sorted comma-separated names). */
+export function categoriesLabel(categories: CategoryFilter): string {
+  if (categories === "all") return "all";
+  return [...categories].sort().join(",");
+}
 
 function toInt(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isInteger(value)) return value;
@@ -345,6 +388,8 @@ export interface OverviewFile {
 export interface OverviewSections {
   unanchored?: Finding[];
   capped?: Finding[];
+  /** Fix-brief findings that are not already shown as inline / unanchored / capped. */
+  alsoInBrief?: Finding[];
   /** Scored findings that did not meet the publish gate (severity/confidence). */
   belowGateCount?: number;
   /** Pull request title used in the overview. */
@@ -358,7 +403,49 @@ export interface OverviewSections {
 /** Whether the payload has anything worth posting (inline comments or gated summary sections). */
 export function payloadHasContent(payload: GitHubReviewPayload): boolean {
   if (payload.comments.length > 0) return true;
-  return /### Could not place inline|### Over the inline cap/.test(payload.body);
+  return /### Could not place inline|### Over the inline cap|### Also in the fix brief/.test(payload.body);
+}
+
+/** One path (and optional skip reason) for a collapsible file-list footer. */
+export interface FileListEntry {
+  path: string;
+  note?: string;
+}
+
+/** Parse `path (reason)` skip strings into path + note. */
+export function parseSkippedEntry(entry: string): FileListEntry {
+  const match = /^(.*) \(([^)]*)\)\s*$/.exec(entry);
+  if (match) return { path: match[1], note: match[2] };
+  return { path: entry };
+}
+
+/**
+ * Markdown footer: short tally plus a `<details>` list of files.
+ * `heading` is the bold lead-in (e.g. `**Skipped:**`); `summary` is the accordion label.
+ */
+export function formatFileListFooter(
+  heading: string,
+  entries: FileListEntry[],
+  summary: string,
+): string {
+  if (!entries.length) return "";
+  const reasonCounts = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.note) reasonCounts.set(entry.note, (reasonCounts.get(entry.note) ?? 0) + 1);
+  }
+  const tallyParts = [...reasonCounts.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([reason, count]) => `${count} ${reason}`);
+  const n = entries.length;
+  const fileWord = n === 1 ? "file" : "files";
+  const lead = tallyParts.length
+    ? `${heading} ${n} ${fileWord} were not reviewed (${tallyParts.join(", ")}).`
+    : `${heading} ${n} ${fileWord}.`;
+  const bullets = entries.map((entry) => {
+    const path = `\`${entry.path.replace(/`/g, "\\`")}\``;
+    return entry.note ? `- ${path} (${entry.note})` : `- ${path}`;
+  });
+  return [lead, "", "<details>", `<summary>${summary}</summary>`, "", ...bullets, "", "</details>"].join("\n");
 }
 
 const CHANGES_CAP = 20;
@@ -434,6 +521,7 @@ export function reviewOverviewBody(
 ): string {
   const unanchored = sections.unanchored ?? [];
   const capped = sections.capped ?? [];
+  const alsoInBrief = sections.alsoInBrief ?? [];
   const belowGateCount = sections.belowGateCount ?? 0;
   const files = sections.files ?? [];
   const reviewedCount = files.filter((file) => file.reviewed).length;
@@ -441,6 +529,9 @@ export function reviewOverviewBody(
   const commentCount = inline.length;
   const title = (sections.title ?? "").trim();
   const paragraph = firstOverviewParagraph(sections.body ?? "");
+  const briefExtra = alsoInBrief.length
+    ? `, plus ${alsoInBrief.length} more finding${alsoInBrief.length === 1 ? "" : "s"} summarised below and included in the fix brief`
+    : "";
 
   const parts = ["## Pull request overview", ""];
   if (title) parts.push(title, "");
@@ -449,7 +540,7 @@ export function reviewOverviewBody(
   parts.push(
     "**Reviewed changes**",
     "",
-    `FixBrief AI reviewed ${reviewedCount} out of ${totalFiles || reviewedCount || "?"} changed file${(totalFiles || reviewedCount) === 1 ? "" : "s"} in this pull request and generated ${commentCount} comment${commentCount === 1 ? "" : "s"}.`,
+    `FixBrief AI reviewed ${reviewedCount} out of ${totalFiles || reviewedCount || "?"} changed file${(totalFiles || reviewedCount) === 1 ? "" : "s"} in this pull request and generated ${commentCount} comment${commentCount === 1 ? "" : "s"}${briefExtra}.`,
     "",
   );
   if (!inline.length) {
@@ -459,7 +550,7 @@ export function reviewOverviewBody(
     );
     if (belowGateCount > 0) {
       parts.push(
-        `_${belowGateCount} other finding${belowGateCount === 1 ? " was" : "s were"} scored but stayed below the publish gate (see \`findings.json\` / the job summary)._`,
+        `_${belowGateCount} other finding${belowGateCount === 1 ? " was" : "s were"} scored but stayed below the publish gate (see the workflow job summary)._`,
         "",
       );
     }
@@ -497,6 +588,16 @@ export function reviewOverviewBody(
       "",
     );
   }
+  if (alsoInBrief.length) {
+    parts.push(
+      "### Also in the fix brief",
+      "",
+      "_These findings are included in `fix-brief.md` and are not posted as inline comments._",
+      "",
+      ...alsoInBrief.map(summaryFindingBullet),
+      "",
+    );
+  }
   return parts.join("\n").trimEnd() + "\n";
 }
 
@@ -526,7 +627,8 @@ export function hasMultiRunAgreement(finding: Finding): boolean {
 /**
  * Whether a scored finding is eligible for an inline GitHub review comment.
  * Calibrated against beatbax: only critical/high above the confidence floor post inline;
- * medium/low/info stay off the PR (they remain in findings.json / the job summary).
+ * medium findings that clear the fix-brief floor are summarised in the overview instead,
+ * and low/info stay in the job summary (or findings.json when debug-artifacts is on).
  * Agreement across consistency runs adjusts the confidence score; it does not hide
  * critical/high findings that already clear the floor (one-off highs still publish).
  * `requireMultiRun` is accepted for call-site compatibility and is unused here.
@@ -574,7 +676,7 @@ export const FIX_BRIEF_MEDIUM_CONFIDENCE = 0.75;
  * Whether a scored finding belongs in fix-brief.md.
  * Always includes the PR publish set (critical/high ≥ minimumConfidence), including one-offs.
  * Also includes medium severity at or above fixBriefMediumConfidence (default 0.75).
- * Low/info stay out of the brief (job summary / findings.json only).
+ * Low/info stay out of the brief (job summary only unless debug-artifacts is on).
  * When requireMultiRun is set, one-off *medium* findings stay out of the brief.
  */
 export function qualifiesForFixBrief(
@@ -609,14 +711,22 @@ export function githubReviewPayload(
   unanchored: Finding[] = [],
   requireMultiRun = false,
   overview: Pick<OverviewSections, "title" | "body" | "files"> = {},
+  fixBriefMediumConfidence = FIX_BRIEF_MEDIUM_CONFIDENCE,
 ): GitHubReviewPayload {
   const published = publishableFindings(anchored, unanchored, minimumConfidence, maxComments, requireMultiRun);
-  const belowGateCount = Math.max(0, anchored.length + unanchored.length - published.all.length);
+  const publishedKeys = new Set(published.all.map(findingFingerprint));
+  const alsoInBrief = fixBriefFindings(
+    [...anchored, ...unanchored], minimumConfidence, fixBriefMediumConfidence, requireMultiRun,
+  ).filter((finding) => !publishedKeys.has(findingFingerprint(finding)));
+  const belowGateCount = Math.max(
+    0, anchored.length + unanchored.length - published.all.length - alsoInBrief.length,
+  );
   return {
     event: "COMMENT",
     body: reviewOverviewBody(published.inline, minimumConfidence, {
       unanchored: published.unanchored,
       capped: published.capped,
+      alsoInBrief,
       belowGateCount,
       title: overview.title,
       body: overview.body,
