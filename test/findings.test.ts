@@ -1,10 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  applySeverityPolicy, findingRejectReason, fixBriefFindings, githubReviewPayload, isTypingStyleNit,
-  parseFindingMarker, parseResponse, partitionInline, publishableFindings, qualifiesForFixBrief,
-  qualifiesForInline, rankFindings, renderFinding, repairFindingsPrompt, reviewOverviewBody,
+  applySeverityPolicy, categoriesLabel, filterByCategories, findingRejectReason,
+  fixBriefFindings, formatFileListFooter, githubReviewPayload, isTypingStyleNit,
+  parseCategories, parseFindingMarker, parseResponse, parseSkippedEntry, partitionInline,
+  payloadHasContent, publishableFindings, qualifiesForFixBrief, qualifiesForInline,
+  rankFindings, renderFinding, repairFindingsPrompt, reviewOverviewBody,
 } from "../src/findings.ts";
+import { reviewSystemPrompt } from "../src/fixbrief-ai.ts";
 
 const sig = (o: any) => ({ id: "S", category: "security", severity: "high", confidence: 0.95, file: "a.py", line: 2, title: "t", description: "d", ...o });
 
@@ -180,13 +183,14 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
     files: [{ path: "a.py", reviewed: true, comments: 1 }],
   });
   assert.match(payload.body, /## Pull request overview/);
-  assert.match(payload.body, /generated 1 comment/);
+  assert.match(payload.body, /generated 1 comment, plus 2 more findings summarised below and included in the fix brief/);
   assert.doesNotMatch(payload.body, /\*\*Keep\*\*/);
   assert.doesNotMatch(payload.body, /Also noted/);
   assert.doesNotMatch(payload.body, /\*\*Drop\*\*/);
   assert.doesNotMatch(payload.body, /\*\*Low severity drop\*\*/);
-  assert.doesNotMatch(payload.body, /\*\*Medium never inline\*\*/);
-  assert.doesNotMatch(payload.body, /\*\*Unanchored medium\*\*/);
+  assert.match(payload.body, /### Also in the fix brief/);
+  assert.match(payload.body, /\*\*Medium never inline\*\*/);
+  assert.match(payload.body, /\*\*Unanchored medium\*\*/);
   assert.match(payload.body, /### Could not place inline/);
   assert.match(payload.body, /\*\*Unanchored high\*\*/);
   assert.match(payload.body, /\*\*Recommendation:\*\* fix it/);
@@ -201,6 +205,81 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
   assert.match(capped.body, /### Over the inline cap/);
   assert.match(capped.body, /\*\*Second\*\*/);
   assert.match(capped.body, /\*\*Recommendation:\*\* Raise the cap\./);
+});
+
+test("fix-brief medium findings appear in the overview; weaker findings stay off it", () => {
+  const payload = githubReviewPayload([
+    sig({ confidence: 0.9, title: "Inline high", line: 1 }),
+    sig({ severity: "medium", confidence: 0.75, title: "Brief medium", line: 2, description: "Edge case.", recommendation: "Guard it." }),
+    sig({ severity: "medium", confidence: 0.74, title: "Too weak medium", line: 3 }),
+    sig({ severity: "low", confidence: 0.99, title: "Low stays off", line: 4 }),
+  ] as any, 0.85);
+  assert.equal(payload.comments.length, 1);
+  assert.match(payload.body, /generated 1 comment, plus 1 more finding summarised below and included in the fix brief/);
+  assert.match(payload.body, /### Also in the fix brief/);
+  assert.match(payload.body, /\*\*Brief medium\*\*/);
+  assert.match(payload.body, /Edge case\./);
+  assert.match(payload.body, /\*\*Recommendation:\*\* Guard it\./);
+  assert.doesNotMatch(payload.body, /\*\*Too weak medium\*\*/);
+  assert.doesNotMatch(payload.body, /\*\*Low stays off\*\*/);
+  assert.doesNotMatch(payload.body, /\*\*Inline high\*\*/);
+  assert.equal(payloadHasContent(payload), true);
+
+  const briefOnly = githubReviewPayload([
+    sig({ severity: "medium", confidence: 0.8, title: "Only in brief", line: 5, description: "Worth noting." }),
+  ] as any, 0.85);
+  assert.equal(briefOnly.comments.length, 0);
+  assert.match(briefOnly.body, /### Also in the fix brief/);
+  assert.match(briefOnly.body, /\*\*Only in brief\*\*/);
+  assert.equal(payloadHasContent(briefOnly), true);
+});
+
+test("parseCategories / filterByCategories allowlist findings; unknown names throw", () => {
+  assert.equal(parseCategories(""), "all");
+  assert.equal(parseCategories("all"), "all");
+  assert.equal(parseCategories("*"), "all");
+  const allowed = parseCategories("security, Compliance quality");
+  assert.ok(allowed !== "all");
+  assert.deepEqual([...allowed].sort(), ["compliance", "quality", "security"]);
+  assert.equal(categoriesLabel(allowed), "compliance,quality,security");
+  assert.throws(() => parseCategories("security,style"), /Unknown category: style/);
+  assert.throws(() => parseCategories("???"), /Unknown/);
+  const findings = [
+    sig({ category: "security", title: "sec" }),
+    sig({ category: "quality", title: "qual" }),
+    sig({ category: "documentation", title: "docs" }),
+  ] as any;
+  assert.deepEqual(filterByCategories(findings, "all").map((f) => f.title), ["sec", "qual", "docs"]);
+  assert.deepEqual(filterByCategories(findings, allowed).map((f) => f.title), ["sec", "qual"]);
+  const narrowed = reviewSystemPrompt(allowed);
+  assert.match(narrowed, /Category filter: only emit findings whose category is one of: compliance, quality, security/);
+  assert.equal(reviewSystemPrompt("all"), reviewSystemPrompt());
+  assert.doesNotMatch(reviewSystemPrompt("all"), /Category filter:/);
+  assert.match(reviewSystemPrompt("all"), /OWASP-class/);
+  assert.match(reviewSystemPrompt("all"), /linters, formatters, and dedicated SAST tools/);
+});
+
+test("formatFileListFooter tallies reasons and collapses files into a details accordion", () => {
+  assert.equal(formatFileListFooter("**Skipped:**", [], "Show skipped files"), "");
+  assert.deepEqual(parseSkippedEntry("samples/a.dmc (binary)"), { path: "samples/a.dmc", note: "binary" });
+  assert.deepEqual(parseSkippedEntry("plain.ts"), { path: "plain.ts" });
+  const skipped = formatFileListFooter("**Skipped:**", [
+    { path: "a.dmc", note: "binary" },
+    { path: "b.dmc", note: "binary" },
+    { path: "package-lock.json", note: "lockfile/generated/binary" },
+  ], "Show skipped files");
+  assert.match(skipped, /\*\*Skipped:\*\* 3 files were not reviewed \(2 binary, 1 lockfile\/generated\/binary\)\./);
+  assert.match(skipped, /<summary>Show skipped files<\/summary>/);
+  assert.match(skipped, /`a\.dmc` \(binary\)/);
+  assert.match(skipped, /`package-lock\.json` \(lockfile\/generated\/binary\)/);
+  const unreviewed = formatFileListFooter(
+    "**Not reviewed (exceeded MAX_BATCHES=40):**",
+    [{ path: "big.ts" }, { path: "huge.ts" }],
+    "Show not reviewed files",
+  );
+  assert.match(unreviewed, /\*\*Not reviewed \(exceeded MAX_BATCHES=40\):\*\* 2 files\./);
+  assert.match(unreviewed, /`big\.ts`/);
+  assert.doesNotMatch(unreviewed, /were not reviewed/);
 });
 
 test("normalizeFinding maps confidence levels and numbers; missing is low", () => {

@@ -179,7 +179,11 @@ test("e2e: failed batches are reported in batch order, not completion order", as
       assert.equal(r.code, 0, r.stderr);
       const files = (findingsJson(dir).failedBatches as string[]).map((label) => label.replace(/ \(part \d+\/\d+\)$/, ""));
       assert.deepEqual(files, ["two.py", "three.py"]);
-      assert.match(readFileSync(join(dir, "out", "review.md"), "utf8"), /two\.py[^,\n]*, three\.py/);
+      const review = readFileSync(join(dir, "out", "review.md"), "utf8");
+      assert.match(review, /Show not reviewed files/);
+      assert.match(review, /`two\.py`/);
+      assert.match(review, /`three\.py`/);
+      assert.ok(review.indexOf("`two.py`") < review.indexOf("`three.py`"));
     });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

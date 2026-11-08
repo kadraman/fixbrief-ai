@@ -42,3 +42,5 @@ jobs:
           model: ${{ vars.LLM_MODEL }}
           provider: ${{ vars.LLM_PROVIDER || 'openai' }}
           base-url: ${{ vars.LLM_BASE_URL }}
+          # Optional: limit categories (default all). Style/lint nits stay out of scope.
+          # categories: security,compliance,quality

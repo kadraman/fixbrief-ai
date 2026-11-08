@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  attachReportBack, matchCommentIds, renderReportBackSection, reportBackItem,
+  appendBriefDownloadLink, attachReportBack, briefDownloadBlock, matchCommentIds,
+  renderReportBackSection, reportBackItem,
 } from "../src/attach-replies.ts";
 import { findingMarker, type FixBriefTargetsFile } from "../src/findings.ts";
 
@@ -81,4 +82,18 @@ test("attachReportBack appends and replaces the Report back section", () => {
   assert.equal(text.split("## Report back").length, 2);
   assert.match(text, /\/comments\/99\/replies/);
   assert.doesNotMatch(text, /\/comments\/55\/replies/);
+});
+
+test("appendBriefDownloadLink adds usage instructions and does not duplicate", () => {
+  const url = "https://example.com/fix-brief.md";
+  const block = briefDownloadBlock(url);
+  assert.match(block, /\[download fix-brief\.md\]\(https:\/\/example\.com\/fix-brief\.md\)/);
+  assert.match(block, /check out this pull request/);
+  assert.match(block, /coding assistant/);
+  const once = appendBriefDownloadLink("## Pull request overview\n\nHello.\n", url);
+  assert.match(once, /Download `fix-brief\.md`/);
+  assert.match(once, /comment back on this pull request/);
+  const twice = appendBriefDownloadLink(once, url);
+  assert.equal(twice, once);
+  assert.equal(twice.split("download fix-brief.md").length, 2);
 });
