@@ -12,8 +12,8 @@
 # it stays silent so the earlier review remains. Inline comments are anchored
 # to GitHub's PR diff even when the model sees extra context lines.
 # Default consistency-runs is 2: agreement adjusts confidence; critical/high that
-# clear the floor still publish as one-offs. findings.json is always uploaded as
-# a workflow artifact; set debug-artifacts: true for extra debug files.
+# clear the floor still publish as one-offs. Set debug-artifacts: true only when
+# you need findings.json / review-payload.json (they contain code excerpts).
 
 name: FixBrief AI - PR Review
 

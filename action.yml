@@ -82,7 +82,7 @@ inputs:
     required: false
     default: "12000"
   debug-artifacts:
-    description: "true to also upload review-payload.json, fix-brief-targets.json, and scope.txt (they contain code excerpts). findings.json is always uploaded."
+    description: "true to upload findings.json, review-payload.json, fix-brief-targets.json, and scope.txt (they contain code excerpts — keep off unless you need them)."
     required: false
     default: "false"
 
@@ -323,21 +323,13 @@ runs:
         gh api --method PUT "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --input "$PATCH" >/dev/null
         echo "Patched review $REVIEW_ID with fix-brief download link."
 
-    - name: Upload findings.json
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: findings-pr-${{ github.event.pull_request.number }}
-        path: ${{ runner.temp }}/fixbrief-ai/findings.json
-        retention-days: 14
-        if-no-files-found: ignore
-
     - name: Upload debug artifacts
       if: always() && inputs.debug-artifacts == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: fixbrief-ai-debug-pr-${{ github.event.pull_request.number }}
         path: |
+          ${{ runner.temp }}/fixbrief-ai/findings.json
           ${{ runner.temp }}/fixbrief-ai/review-payload.json
           ${{ runner.temp }}/fixbrief-ai/fix-brief-targets.json
           ${{ runner.temp }}/fixbrief-ai/scope.txt

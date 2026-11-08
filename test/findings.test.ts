@@ -137,7 +137,7 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
   assert.match(empty, /No inline findings met the publish gate/);
   assert.doesNotMatch(empty, /Also noted/);
   const emptyWithBelow = reviewOverviewBody([], 0.85, { belowGateCount: 3 });
-  assert.match(emptyWithBelow, /3 other findings were scored but stayed below the publish gate \(see the workflow job summary or the `findings\.json` artifact\)/);
+  assert.match(emptyWithBelow, /3 other findings were scored but stayed below the publish gate \(see the workflow job summary\)/);
   const body = reviewOverviewBody([
     sig({ severity: "high", title: "CRLF blank context", file: "src/difflines.ts", line: 34 }),
     sig({ severity: "critical", confidence: 0.95, title: "Fence length", file: "src/findings.ts", line: 128 }),
