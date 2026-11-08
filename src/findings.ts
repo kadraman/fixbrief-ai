@@ -272,6 +272,11 @@ function severityLabel(severity: FindingSeverity): string {
   return severity.charAt(0).toUpperCase() + severity.slice(1);
 }
 
+/** Floor lengths so shrink-to-fit never leaves unreadable stubs like "The scr…". */
+const MIN_DESCRIPTION = 120;
+const MIN_RECOMMENDATION = 60;
+const MIN_TITLE = 24;
+
 /** Render one concise, bounded GitHub review comment. Prefer keeping a GitHub suggestion by shrinking prose first. */
 export function renderFinding(finding: Finding, maxLength = 800): string {
   // Copilot-style: severity top-right, prose body, optional suggestion. No confidence percentage.
@@ -300,12 +305,12 @@ export function renderFinding(finding: Finding, maxLength = 800): string {
     let body = compose(includeSuggestion);
     while (body.length > maxLength) {
       const excess = body.length - maxLength;
-      if (description.length) {
-        description = shorten(description, Math.max(0, description.length - excess - 1));
-      } else if (recommendation.length) {
-        recommendation = shorten(recommendation, Math.max(0, recommendation.length - excess - 1));
-      } else if (title.length) {
-        title = shorten(title, Math.max(0, title.length - excess - 1));
+      if (description.length > MIN_DESCRIPTION) {
+        description = shorten(description, Math.max(MIN_DESCRIPTION, description.length - excess - 1));
+      } else if (recommendation.length > MIN_RECOMMENDATION) {
+        recommendation = shorten(recommendation, Math.max(MIN_RECOMMENDATION, recommendation.length - excess - 1));
+      } else if (title.length > MIN_TITLE) {
+        title = shorten(title, Math.max(MIN_TITLE, title.length - excess - 1));
       } else {
         break;
       }
@@ -316,8 +321,8 @@ export function renderFinding(finding: Finding, maxLength = 800): string {
 
   let includeSuggestion = Boolean(suggestion);
   let body = shrinkProse(includeSuggestion);
-  // Only drop the suggestion when it still cannot fit after prose is exhausted.
-  // Never truncate mid-fence — an incomplete suggestion block absorbs following Markdown.
+  // If a suggestion still cannot fit after prose is at the readable floors, drop it and
+  // restore full prose. Never truncate mid-fence — an incomplete suggestion absorbs Markdown.
   if (body.length > maxLength && includeSuggestion) {
     includeSuggestion = false;
     suggestionNote = "**Suggestion omitted:** it exceeds the comment length limit.";
@@ -484,23 +489,14 @@ export function changesBulletsFromBody(body: string): string[] {
     .filter(Boolean);
 }
 
+/** Semantic Changes bullets from the PR body only — never a raw path dump (GitHub already lists files). */
 function changeBullets(sections: OverviewSections): string[] {
   const fromBody = changesBulletsFromBody(sections.body ?? "");
-  if (fromBody.length) {
-    if (fromBody.length <= CHANGES_CAP) return fromBody.map((item) => `- ${item}`);
-    return [
-      ...fromBody.slice(0, CHANGES_CAP).map((item) => `- ${item}`),
-      `- _and ${fromBody.length - CHANGES_CAP} more_`,
-    ];
-  }
-  const files = sections.files ?? [];
-  if (!files.length) return ["- _(no file list available)_"];
-  if (files.length <= CHANGES_CAP) {
-    return files.map((file) => `- \`${file.path.replace(/`/g, "\\`")}\``);
-  }
+  if (!fromBody.length) return [];
+  if (fromBody.length <= CHANGES_CAP) return fromBody.map((item) => `- ${item}`);
   return [
-    ...files.slice(0, CHANGES_CAP).map((file) => `- \`${file.path.replace(/`/g, "\\`")}\``),
-    `- _and ${files.length - CHANGES_CAP} more_`,
+    ...fromBody.slice(0, CHANGES_CAP).map((item) => `- ${item}`),
+    `- _and ${fromBody.length - CHANGES_CAP} more_`,
   ];
 }
 
@@ -511,6 +507,37 @@ function perFileSummaryLine(file: OverviewFile): string {
   }
   const n = file.comments;
   return `- ${path}: reviewed, ${n} comment${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * Copilot-style per-file details: files with comments, then unreviewed files.
+ * Quiet zero-comment reviews are tallied in one line instead of listing every path.
+ */
+function perFileDetails(files: OverviewFile[]): string[] {
+  const withComments = files.filter((file) => file.reviewed && file.comments > 0);
+  const unreviewed = files.filter((file) => !file.reviewed);
+  const quietReviewed = files.filter((file) => file.reviewed && file.comments === 0).length;
+  if (!withComments.length && !unreviewed.length && !quietReviewed) return [];
+  const lines = [
+    "<details>",
+    "<summary>Show a summary per file</summary>",
+    "",
+  ];
+  if (withComments.length) {
+    lines.push(...withComments.map(perFileSummaryLine));
+  }
+  if (quietReviewed) {
+    if (withComments.length) lines.push("");
+    lines.push(
+      `- _${quietReviewed} other reviewed file${quietReviewed === 1 ? "" : "s"} with no comments_`,
+    );
+  }
+  if (unreviewed.length) {
+    if (withComments.length || quietReviewed) lines.push("");
+    lines.push(...unreviewed.map(perFileSummaryLine));
+  }
+  lines.push("", "</details>", "");
+  return lines;
 }
 
 /** Build the create-review overview body shown above the inline comment threads. */
@@ -529,14 +556,15 @@ export function reviewOverviewBody(
   const commentCount = inline.length;
   const title = (sections.title ?? "").trim();
   const paragraph = firstOverviewParagraph(sections.body ?? "");
+  const changes = changeBullets(sections);
   const briefExtra = alsoInBrief.length
     ? `, plus ${alsoInBrief.length} more finding${alsoInBrief.length === 1 ? "" : "s"} summarised below and included in the fix brief`
     : "";
 
-  const parts = ["## Pull request overview", ""];
+  const parts = ["## FixBrief AI review", ""];
   if (title) parts.push(title, "");
   if (paragraph) parts.push(paragraph, "");
-  parts.push("**Changes:**", "", ...changeBullets(sections), "");
+  if (changes.length) parts.push("**Changes:**", "", ...changes, "");
   parts.push(
     "**Reviewed changes**",
     "",
@@ -555,17 +583,7 @@ export function reviewOverviewBody(
       );
     }
   }
-  if (files.length) {
-    parts.push(
-      "<details>",
-      "<summary>Show a summary per file</summary>",
-      "",
-      ...files.map(perFileSummaryLine),
-      "",
-      "</details>",
-      "",
-    );
-  }
+  parts.push(...perFileDetails(files));
   // minimumConfidence is part of the gate; kept in the signature for call-site compatibility.
   void minimumConfidence;
   if (unanchored.length) {
@@ -592,7 +610,7 @@ export function reviewOverviewBody(
     parts.push(
       "### Also in the fix brief",
       "",
-      "_These findings are included in `fix-brief.md` and are not posted as inline comments._",
+      "_These findings cleared the fix-brief bar (typically medium severity) but not the inline gate (critical/high). They are written into `fix-brief.md` for an AI assistant to verify and fix, and are listed here so you can see them without opening every file. They are not posted as inline review threads. Download the brief from the link at the bottom of this review._",
       "",
       ...alsoInBrief.map(summaryFindingBullet),
       "",

@@ -114,26 +114,30 @@ test("renderFinding keeps a short suggestion by shrinking long prose first", () 
   assert.ok(body.length <= 800);
   assert.ok(!body.includes(longDesc));
   assert.match(body, /D…/);
+  assert.ok((body.match(/D+/)?.[0].length ?? 0) >= 120);
   assert.equal(parseFindingMarker(body), "S");
 });
 
-test("renderFinding omits only when the suggestion block itself cannot fit", () => {
+test("renderFinding omits a large suggestion instead of crushing the description", () => {
   const huge = Array.from({ length: 40 }, (_, i) => `line_${i}_xxxxxxxxxxxxxxxx`).join("\n");
+  const description = "Script truncates target source file after replacing BUNDLED_SAMPLES. "
+    + "The script writes a new BUNDLED_SAMPLES block and drops the remainder of the file.";
   const body = renderFinding(sig({
-    description: "Short problem statement.",
-    recommendation: "Rewrite the block.",
+    description,
+    recommendation: "Preserve the remainder of the original file after the original BUNDLED_SAMPLES block.",
     suggestion: huge,
   }) as any, 800);
   assert.match(body, /Suggestion omitted/);
   assert.doesNotMatch(body, /```suggestion/);
-  assert.match(body, /Short problem statement/);
+  assert.match(body, /Script truncates target source file/);
+  assert.doesNotMatch(body, /The scr…/);
   assert.ok(body.length <= 800);
   assert.equal(parseFindingMarker(body), "S");
 });
 
 test("review overview body uses Copilot-style sections; below-gate stay off the PR", () => {
   const empty = reviewOverviewBody([], 0.85);
-  assert.match(empty, /## Pull request overview/);
+  assert.match(empty, /## FixBrief AI review/);
   assert.match(empty, /No inline findings met the publish gate/);
   assert.doesNotMatch(empty, /Also noted/);
   const emptyWithBelow = reviewOverviewBody([], 0.85, { belowGateCount: 3 });
@@ -147,6 +151,7 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
     files: [
       { path: "src/difflines.ts", reviewed: true, comments: 1 },
       { path: "src/findings.ts", reviewed: true, comments: 1 },
+      { path: "quiet.ts", reviewed: true, comments: 0 },
       { path: "other.py", reviewed: false, comments: 0, note: "not on reviewed diff" },
     ],
     unanchored: [sig({
@@ -154,15 +159,17 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
       description: "Cannot attach this line.", recommendation: "Move the change onto an added line.",
     }) as any],
   });
-  assert.match(body, /## Pull request overview/);
+  assert.match(body, /## FixBrief AI review/);
   assert.match(body, /Fix CRLF and fence length/);
   assert.match(body, /This PR hardens the diff parser\./);
   assert.match(body, /\*\*Changes:\*\*/);
   assert.match(body, /- Fix CRLF context/);
-  assert.match(body, /FixBrief AI reviewed 2 out of 3 changed files/);
+  assert.match(body, /FixBrief AI reviewed 3 out of 4 changed files/);
   assert.match(body, /generated 2 comments/);
   assert.match(body, /Show a summary per file/);
   assert.match(body, /`src\/difflines\.ts`: reviewed, 1 comment/);
+  assert.match(body, /1 other reviewed file with no comments/);
+  assert.doesNotMatch(body, /`quiet\.ts`/);
   assert.doesNotMatch(body, /\| Severity \| Count \|/);
   assert.doesNotMatch(body, /confidence ≥/);
   assert.match(body, /### Could not place inline/);
@@ -170,6 +177,14 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
   assert.match(body, /Cannot attach this line\./);
   assert.match(body, /\*\*Recommendation:\*\* Move the change onto an added line\./);
   assert.doesNotMatch(body, /Also noted/);
+  // Without a PR-body Changes section, do not dump raw file paths.
+  const noPathDump = reviewOverviewBody([], 0.85, {
+    title: "Paths only",
+    files: [{ path: "a.py", reviewed: true, comments: 0 }, { path: "b.py", reviewed: true, comments: 0 }],
+  });
+  assert.doesNotMatch(noPathDump, /\*\*Changes:\*\*/);
+  assert.doesNotMatch(noPathDump, /`a\.py`/);
+  assert.match(noPathDump, /2 other reviewed files with no comments/);
   const payload = githubReviewPayload([
     sig({ confidence: 0.9, title: "Keep" }),
     sig({ confidence: 0.5, title: "Drop" }),
@@ -182,13 +197,15 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
     title: "Keep the gate",
     files: [{ path: "a.py", reviewed: true, comments: 1 }],
   });
-  assert.match(payload.body, /## Pull request overview/);
+  assert.match(payload.body, /## FixBrief AI review/);
   assert.match(payload.body, /generated 1 comment, plus 2 more findings summarised below and included in the fix brief/);
   assert.doesNotMatch(payload.body, /\*\*Keep\*\*/);
   assert.doesNotMatch(payload.body, /Also noted/);
   assert.doesNotMatch(payload.body, /\*\*Drop\*\*/);
   assert.doesNotMatch(payload.body, /\*\*Low severity drop\*\*/);
   assert.match(payload.body, /### Also in the fix brief/);
+  assert.match(payload.body, /cleared the fix-brief bar/);
+  assert.match(payload.body, /not the inline gate/);
   assert.match(payload.body, /\*\*Medium never inline\*\*/);
   assert.match(payload.body, /\*\*Unanchored medium\*\*/);
   assert.match(payload.body, /### Could not place inline/);
