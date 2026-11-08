@@ -299,6 +299,7 @@ runs:
       if: steps.review.outputs.has_brief == 'true' && steps.post.outputs.posted == 'true' && steps.post.outputs.review_id != ''
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.github-token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
