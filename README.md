@@ -169,7 +169,7 @@ with:
 
 ## Using the fix brief
 
-The PR review links to the `fix-brief.md` artifact (kept 14 days) and includes a short how-to. Download it, check out the PR branch, and give it to your assistant. For example, with Claude Code:
+The PR review links to the `fix-brief.md` artifact (kept 14 days) and includes a short how-to. That link is part of the review when it is submitted: GitHub's conversation page keeps the original review text and does not show a link added by editing the review afterwards. Download it, check out the PR branch, and give it to your assistant. For example, with Claude Code:
 
 ```bash
 claude -p "$(cat fix-brief.md)"
