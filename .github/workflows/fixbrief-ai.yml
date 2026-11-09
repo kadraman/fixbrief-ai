@@ -7,6 +7,7 @@
 #   Variable  LLM_MODEL      (required; recommended gpt-5-mini)
 #   Variable  LLM_PROVIDER   (optional; default openai)
 #   Variable  LLM_BASE_URL   (optional; leave unset for OpenAI)
+#   Variable  LLM_REFUTE_MODEL (optional; stronger model for the disproof pass only)
 # Optional Variables (passed through when set):
 #   LLM_MAX_OUTPUT_TOKENS, LLM_THINKING, LLM_REQUEST_TIMEOUT_MS
 # Set debug-artifacts: true only when you need findings.json (contains code excerpts).
@@ -42,5 +43,6 @@ jobs:
           provider: ${{ vars.LLM_PROVIDER || 'openai' }}
           base-url: ${{ vars.LLM_BASE_URL }}
           max-output-tokens: ${{ vars.LLM_MAX_OUTPUT_TOKENS || '8192' }}
+          refute-model: ${{ vars.LLM_REFUTE_MODEL }}
           # Optional: limit categories (default all). Style/lint nits stay out of scope.
           # categories: security,compliance,quality

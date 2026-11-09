@@ -16,7 +16,8 @@ src/                       TypeScript library and engine
   fixbrief-ai.ts           review engine (also runs standalone)
   findings.ts              canonical Finding types and GitHub renderer
   confidence.ts            evidence checks and confidence scoring
-  context.ts               per-batch reference context (overview, guidance, usages)
+  context.ts               per-batch reference context (overview, guidance, usages, callee bodies)
+  refute.ts                disproof pass over findings that would otherwise be published
   difflines.ts             diff line maps and inline comment anchoring
   attach-replies.ts        attach per-finding PR reply commands to fix-brief.md
 scripts/                   local CLIs and Action helpers
@@ -122,10 +123,16 @@ Use `actions/checkout` with `fetch-depth: 0` (as in the example) so very large d
 | `post-comment` | `true` | post the review as a PR comment |
 | `github-token` | `github.token` | needs `pull-requests: write` |
 | `diff-context-lines` | `10` | lines of context around each change in the diff the model reads (GitHub's own diff has 3; inline comments are still anchored to that PR diff) |
-| `context-chars` | `12000` | cap for the reference context (PR file overview, project guidance, other usages of changed symbols) added to each review call; `0` turns it off |
+| `context-chars` | `12000` | cap for the reference context (PR file overview, project guidance, other usages of changed symbols, and bodies of functions those lines call) added to each review call; `0` turns the block off. This is a checkout lookup, not an embedding index |
+| `context-definitions` | `6` | how many callees per batch have their bodies read from the checkout; `0` skips that lookup |
+| `definition-lines` | `80` | max lines of one callee body included in the reference context |
+| `refute` | `true` | after scoring, one extra call checks findings that would be posted or written into the fix brief and drops a finding only when that call says it is false and gives a reason. A bad reply keeps the finding |
+| `refute-model` | review model | optional stronger model for that disproof pass only |
+| `refute-provider` | review provider | `openai` or `anthropic` for the disproof pass |
+| `refute-base-url` | review base URL | API root for the disproof pass; when the provider changes and this is blank, the provider default is used |
 | `debug-artifacts` | `false` | when `true`, upload `findings.json`, `review-payload.json`, `fix-brief-targets.json`, and `scope.txt` (they contain code excerpts — leave off by default) |
 
-Engine-only environment variables (optional, for local runs or advanced tuning): `CONTEXT_CALLERS` (usages shown per changed symbol, default `3`), `CONTEXT_SYMBOLS` (symbols looked up per batch, default `12`), `CONTEXT_DOC_CHARS` (cap for the project-guidance excerpt, default `3000`).
+Engine-only environment variables (optional, for local runs or advanced tuning): `CONTEXT_CALLERS` (usages shown per changed symbol, default `3`), `CONTEXT_SYMBOLS` (symbols looked up per batch, default `12`), `CONTEXT_DOC_CHARS` (cap for the project-guidance excerpt, default `3000`). The action inputs above map to `CONTEXT_DEFINITIONS`, `DEFINITION_LINES`, `REFUTE`, `LLM_REFUTE_MODEL`, `LLM_REFUTE_PROVIDER`, and `LLM_REFUTE_BASE_URL`.
 
 Outputs: `review-path`, `fix-brief-path`, `fix-brief-url`.
 
@@ -162,7 +169,7 @@ with:
 
 ## Using the fix brief
 
-The PR review links to the `fix-brief.md` artifact (kept 14 days) and includes a short how-to. Download it, check out the PR branch, and give it to your assistant. For example, with Claude Code:
+The PR review links to the `fix-brief.md` artifact (kept 14 days) and includes a short how-to. That link is part of the review when it is submitted: GitHub's conversation page keeps the original review text and does not show a link added by editing the review afterwards. Download it, check out the PR branch, and give it to your assistant. For example, with Claude Code:
 
 ```bash
 claude -p "$(cat fix-brief.md)"
@@ -177,8 +184,8 @@ or paste/attach it in Copilot, Cursor, or a chat session. The brief tells the as
 1. Split the diff by file; lockfiles, minified files and binaries are skipped (and listed).
 2. A file larger than `piece-chars` (capped by `batch-chars`) is split on hunk boundaries (and on line boundaries inside giant hunks); every part keeps the file header. Split parts are reviewed alone so they are not packed back into one oversized call.
 3. Other pieces are packed into batches up to `batch-chars`.
-4. Each batch is reviewed in its own call (retrying 429/5xx/529 with backoff). If the model still returns invalid JSON (or the request fails), the batch is split further and retried up to two times. Every batch also gets a bounded **reference context** block: a list of files in the PR, the first project-guidance file found (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or `CONTRIBUTING.md`), and other usages of symbols declared on changed lines (`git grep` in the checkout). Findings must still be on changed lines in the diff; reference line numbers are approximate.
-5. Each response is parsed into the canonical Finding schema. Confidence is computed in code from the model's high/medium/low level plus checked evidence (and agreement across consistency runs). By default the review runs twice (`consistency-runs: 2`); findings are clustered across runs and agreement adjusts the score (±0.10). Findings are then gated to severity `critical`/`high` at or above `minimum-confidence` — including one-offs (a single-run high can still post). Those are posted as inline review comments when the line is on **GitHub's PR diff** (the anchor diff), otherwise under “Could not place inline” / “Over the inline cap”. Medium findings that clear the fix-brief floor (≥ `0.75`, env `FIX_BRIEF_MEDIUM_CONFIDENCE`) are summarised under “Also in the fix brief” in the overview (and included in `fix-brief.md`); they are not posted as inline comments. Low/info and weaker medium findings stay in the workflow job summary only (or in `findings.json` when `debug-artifacts` is on). An empty-gate overview notes how many scored findings stayed below the gate and points at the job summary. The fix brief includes the PR-gated set **plus** multi-run medium findings scored ≥ `0.75`. Low/info and one-off medium findings stay out of the brief. The prompt asks the model to skip style, typing, and docs nits so fewer low-value findings are emitted.
+4. Each batch is reviewed in its own call (retrying 429/5xx/529 with backoff). If the model still returns invalid JSON (or the request fails), the batch is split further and retried up to two times. Every batch also gets a bounded **reference context** block: a list of files in the PR, the first project-guidance file found (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or `CONTRIBUTING.md`), other usages of symbols declared on changed lines, and the bodies of functions those changed lines call (`git grep` plus a brace-bounded read in the checkout). Findings must still be on changed lines in the diff; reference line numbers are approximate. A removed inline sequence replaced by a call is not treated as a dropped side effect unless that body shows the work is gone.
+5. Each response is parsed into the canonical Finding schema. Confidence is computed in code from the model's high/medium/low level plus checked evidence (and agreement across consistency runs). By default the review runs twice (`consistency-runs: 2`); findings are clustered across runs and agreement adjusts the score (±0.10). Findings are then gated to severity `critical`/`high` at or above `minimum-confidence` — including one-offs (a single-run high can still post). Before anything is posted, one disproof call (`refute`, default on) sees each finding that would be inlined or written into the fix brief, together with a window of the checked-out file and any callee body. A finding is dropped only when that call returns `keep: false` with a reason; a bad reply or a request error leaves it in place. Dropped findings stay in `findings.json` with that reason (and in the calibration sheet) and are left out of the review and the fix brief. Those that remain are posted as inline review comments when the line is on **GitHub's PR diff** (the anchor diff), otherwise under “Could not place inline” / “Over the inline cap”. Medium findings that clear the fix-brief floor (≥ `0.75`, env `FIX_BRIEF_MEDIUM_CONFIDENCE`) are summarised under “Also in the fix brief” in the overview (and included in `fix-brief.md`); they are not posted as inline comments. Low/info and weaker medium findings stay in the workflow job summary only (or in `findings.json` when `debug-artifacts` is on). An empty-gate overview notes how many scored findings stayed below the gate and points at the job summary. The fix brief includes the PR-gated set **plus** multi-run medium findings scored ≥ `0.75`. Low/info and one-off medium findings stay out of the brief. The prompt asks the model to skip style, typing, and docs nits so fewer low-value findings are emitted. Set `refute-model` to run only this pass on a stronger model.
 
 ### What gets posted, and when
 
@@ -187,7 +194,7 @@ or paste/attach it in Copilot, Cursor, or a chat session. The brief tells the as
 - The review footer names the range (`Reviewed changes since <sha>` vs the full PR) so a partial review is obvious.
 - `create-review` failures fall back to an issue comment built from the gated payload — never the ungated `review.md` dump.
 
-Limitations: batches are reviewed independently, so problems that span files in different batches can be missed (reference context reduces that for symbol usages and project rules). Cost scales with PR size; `max-batches` caps it. If **every** batch fails (bad key, wrong model name), the run fails instead of posting an error comment. Incremental synchronize reviews will not re-discover findings that only appear when the whole PR is reviewed together. Symbol extraction is regex-based and language-agnostic.
+Limitations: batches are reviewed independently, so problems that span files in different batches can be missed (reference context reduces that for symbol usages, callee bodies, and project rules). The callee lookup is a `git grep` plus a brace-bounded read of the checkout, not an embedding index. Cost scales with PR size; `max-batches` caps it. If **every** batch fails (bad key, wrong model name), the run fails instead of posting an error comment. Incremental synchronize reviews will not re-discover findings that only appear when the whole PR is reviewed together. Symbol extraction is regex-based and language-agnostic.
 
 ---
 
@@ -195,7 +202,7 @@ Limitations: batches are reviewed independently, so problems that span files in 
 
 - The diff is sent to your LLM provider. Check that's acceptable for private code.
 - Don't wire this to `pull_request_target` with a checkout of the PR head; that would run an untrusted PR with your secrets in reach. The provided workflow uses `pull_request` and skips fork PRs (GitHub withholds secrets from them anyway).
-- PR title/body are passed through environment variables, never interpolated into shell code, and the model is told the diff and reference context (project docs, code at usage sites) are untrusted data. A determined prompt injection can still skew a review, so treat output as advice.
+- PR title/body are passed through environment variables, never interpolated into shell code, and the model is told the diff and reference context (project docs, code at usage sites, callee bodies, and the file slice used by the disproof pass) are untrusted data. A determined prompt injection can still skew a review, so treat output as advice.
 - Pin the action to a release tag or commit SHA in your workflow.
 - Keep `.env` out of git (it's in `.gitignore`).
 

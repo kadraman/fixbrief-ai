@@ -21,7 +21,7 @@ export interface ReportBackOptions {
   briefPath: string;
   targets: FixBriefTargetsFile;
   comments: ReviewCommentRef[];
-  /** Artifact / gist URL, if already known (optional; usually patched into the review separately). */
+  /** Artifact URL, if already known. The review body includes it when the review is submitted. */
   briefUrl?: string;
 }
 

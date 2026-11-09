@@ -12,7 +12,10 @@
 # it stays silent so the earlier review remains. Inline comments are anchored
 # to GitHub's PR diff even when the model sees extra context lines.
 # Default consistency-runs is 2: agreement adjusts confidence; critical/high that
-# clear the floor still publish as one-offs. Set debug-artifacts: true only when
+# clear the floor still publish as one-offs. refute defaults to true: one extra
+# call can drop a publishable finding when the checkout shows it is false.
+# Set refute-model to use a stronger model for that pass only.
+# Set debug-artifacts: true only when
 # you need findings.json / review-payload.json (they contain code excerpts).
 
 name: FixBrief AI - PR Review

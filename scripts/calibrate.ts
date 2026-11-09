@@ -57,18 +57,19 @@ type FindingRecord = {
   confidenceBreakdown?: { level?: string; anchor?: string; evidence?: string; agreement?: string };
   file: string; line: number; endLine?: number; title: string; description: string; evidence?: string;
   anchored?: boolean; inline?: boolean;
+  refute?: { keep?: boolean; reason?: string };
 };
 type FindingsFile = { schemaVersion?: number; model?: string; minimumConfidence?: number; findings: FindingRecord[]; failedBatches?: string[] };
 type Label = "tp" | "fp" | "unsure" | "";
 type Row = {
   key: string; pr: number; prUrl: string; file: string; line: number; severity: string; category: string;
   level: string; confidence: number; anchored: boolean; inline: boolean; evidence: string; anchor: string;
-  humanCommented: boolean; title: string; description: string; label: Label; notes: string;
+  humanCommented: boolean; title: string; description: string; refute: string; label: Label; notes: string;
 };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CSV_COLUMNS = ["key", "pr", "pr_url", "file", "line", "severity", "category", "level", "confidence", "anchored",
-  "inline", "evidence_check", "anchor", "human_commented", "title", "description", "label", "notes"];
+  "inline", "evidence_check", "anchor", "human_commented", "title", "description", "refute", "label", "notes"];
 
 // ------------------------------------------------------------------ helpers
 function fail(message: string): never { throw new Error(message); }
@@ -274,6 +275,13 @@ export function rescore(b: NonNullable<FindingRecord["confidenceBreakdown"]>): n
   return Math.round(Math.min(1, Math.max(0, parts.reduce((sum, p) => sum + p, 0))) * 100) / 100;
 }
 
+function refuteCell(s: FindingRecord): string {
+  if (!s.refute || typeof s.refute.keep !== "boolean") return "";
+  const reason = (s.refute.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+  if (s.refute.keep) return reason ? `keep: ${reason}` : "keep";
+  return reason ? `drop: ${reason}` : "drop";
+}
+
 function loadRows(out: string, rescoreOn = false): Row[] {
   const rows: Row[] = [];
   for (const number of prDirs(out)) {
@@ -290,7 +298,8 @@ function loadRows(out: string, rescoreOn = false): Row[] {
         confidence: rescoreOn ? (rescore({ ...b, level: b.level ?? s.level }) ?? s.confidence) : s.confidence,
         anchored: s.anchored ?? false, inline: s.inline ?? false, evidence: b.evidence ?? "n/a", anchor: b.anchor ?? "n/a",
         humanCommented: comments.some((c) => c.path === s.file && c.line !== null && Math.abs(c.line - s.line) <= 5),
-        title: s.title, description: s.description.replace(/\s+/g, " ").slice(0, 400), label: "", notes: "",
+        title: s.title, description: s.description.replace(/\s+/g, " ").slice(0, 400),
+        refute: refuteCell(s), label: "", notes: "",
       });
     }
   }
@@ -326,7 +335,7 @@ function label(opts: Options): void {
     const previous = existing.get(row.key);
     if (previous?.label) carried++;
     const cells = [row.key, row.pr, row.prUrl, row.file, row.line, row.severity, row.category, row.level, row.confidence,
-      row.anchored, row.inline, row.evidence, row.anchor, row.humanCommented, row.title, row.description,
+      row.anchored, row.inline, row.evidence, row.anchor, row.humanCommented, row.title, row.description, row.refute,
       previous?.label ?? "", previous?.notes ?? ""];
     lines.push(cells.map(csvEscape).join(","));
   }
@@ -434,7 +443,8 @@ function report(opts: Options): void {
     groupTable("By evidence check", rows, (r) => r.evidence, ["found", "partial", "not_found", "missing", "n/a"]), "",
     groupTable("By anchor", rows, (r) => r.anchor, ["added", "context", "none", "n/a"]), "",
     groupTable("By severity", rows, (r) => r.severity, ["critical", "high", "medium", "low", "info"]), "",
-    groupTable("By category", rows, (r) => r.category), "");
+    groupTable("By category", rows, (r) => r.category), "",
+    groupTable("By disproof verdict", rows, (r) => r.refute.startsWith("drop") ? "dropped" : r.refute.startsWith("keep") ? "kept" : "not checked"), "");
   md.push("> `human-commented` is the share of findings within 5 lines of a human review comment on the same file. It is a weak proxy (reviewers miss things and comment on style), useful mainly when few labels exist.", "");
   const stable = stability(out);
   if (stable) md.push(stable, "");

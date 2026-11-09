@@ -27,6 +27,12 @@ export interface ConfidenceBreakdown {
 
 export type FindingSeverity = "critical" | "high" | "medium" | "low" | "info";
 
+/** Outcome of the disproof pass for one finding. `keep: false` means it was dropped. */
+export interface RefuteNote {
+  keep: boolean;
+  reason: string;
+}
+
 export interface Finding {
   id: string;
   category: FindingCategory;
@@ -44,6 +50,8 @@ export interface Finding {
   level?: ConfidenceLevel;
   evidence?: string;
   confidenceBreakdown?: ConfidenceBreakdown;
+  /** Set when a disproof pass judged this finding. Absent when it was not checked. */
+  refute?: RefuteNote;
 }
 
 export interface GitHubReviewComment {
