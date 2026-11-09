@@ -4,7 +4,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { annotateDiff, parseDiffLines } from "../src/difflines.ts";
-import { changedSymbols, contextOptionsFromEnv, createContextBuilder, readProjectGuidance, summarizeDiff, usageSection } from "../src/context.ts";
+import {
+  calledSymbols, changedSymbols, contextOptionsFromEnv, createContextBuilder, definitionSection, isDefinitionLine,
+  readProjectGuidance, sliceDefinition, summarizeDiff, usageSection,
+} from "../src/context.ts";
 import type { ContextOptions } from "../src/context.ts";
 
 const DIFF = [
@@ -25,7 +28,10 @@ const DIFF = [
   "diff --git a/old.ts b/old.ts", "deleted file mode 100644", "--- a/old.ts", "+++ /dev/null", "@@ -1,1 +0,0 @@", "-gone",
 ].join("\n");
 const annotated = DIFF.split(/(?=^diff --git )/m).map(annotateDiff).join("\n");
-const opts = (over: Partial<ContextOptions> = {}): ContextOptions => ({ root: "/nonexistent", maxChars: 12000, callersPerSymbol: 3, maxSymbols: 12, docChars: 3000, ...over });
+const opts = (over: Partial<ContextOptions> = {}): ContextOptions => ({
+  root: "/nonexistent", maxChars: 12000, callersPerSymbol: 3, maxSymbols: 12, docChars: 3000,
+  maxDefinitions: 6, definitionLines: 80, ...over,
+});
 
 test("summarizeDiff counts lines and recognises new and deleted files", () => {
   const files = summarizeDiff(DIFF);
@@ -88,11 +94,90 @@ test("createContextBuilder: disabled at 0, bounded, memoised, and never throws",
   assert.equal(throwing(batch), "");
 });
 
+test("calledSymbols reads callees on added lines and skips declarations, keywords, and generic names", () => {
+  const symbols = calledSymbols(annotated, 12);
+  assert.deepEqual(symbols, ["load"]);
+  const resize = [
+    "@@ -1,3 +1,3 @@ private _onWindowResize",
+    "    1   private _onWindowResize = () => {",
+    "-    this._invalidateGlobalCursorLayout();",
+    "    2 +    this._applyScale();",
+    "    3   };",
+    "    4 +  private _applyScale(): void {",
+  ].join("\n");
+  assert.deepEqual(calledSymbols(resize, 6), ["_applyScale"]);
+});
+
+test("sliceDefinition stops at the matching brace and caps the line count", () => {
+  const source = [
+    "function other() { return 1; }",
+    "private _applyScale(): void {",
+    "  content.style.width = '1px';",
+    "  if (ready) { this._invalidateGlobalCursorLayout(); }",
+    "  this._syncRangeDom();",
+    "}",
+    "function next() { return 2; }",
+  ].join("\n");
+  const body = sliceDefinition(source, 2, 80);
+  assert.match(body, /_invalidateGlobalCursorLayout/);
+  assert.match(body, /_syncRangeDom/);
+  assert.doesNotMatch(body, /function next/);
+  assert.equal(sliceDefinition(source, 2, 2).split("\n").length, 2);
+});
+
+test("definitionSection includes a callee body from the checkout and skips one already in the batch", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ctx-def-"));
+  const source = [
+    "export class PatternGrid {",
+    "  private _onWindowResize = () => {",
+    "    this._applyScale();",
+    "  };",
+    "  private _applyScale(): void {",
+    "    content.style.width = '1px';",
+    "    this._invalidateGlobalCursorLayout();",
+    "    this._syncRangeDom();",
+    "  }",
+    "}",
+  ].join("\n");
+  try {
+    writeFileSync(join(dir, "pattern-grid.ts"), source);
+    const batch = [
+      "@@ -1,4 +1,4 @@ private _onWindowResize",
+      "    2   private _onWindowResize = () => {",
+      "-    this._invalidateGlobalCursorLayout();",
+      "    3 +    this._applyScale();",
+      "    4   };",
+    ].join("\n");
+    assert.equal(isDefinitionLine("_applyScale", "    this._applyScale();"), false);
+    assert.equal(isDefinitionLine("_applyScale", "  private _applyScale(): void {"), true);
+    const grep = (symbol: string) => symbol === "_applyScale"
+      ? ["pattern-grid.ts:3:    this._applyScale();", "pattern-grid.ts:5:  private _applyScale(): void {", "other.ts:1:  function _applyScale() { return 1; }"]
+      : [];
+    const section = definitionSection(["_applyScale"], batch, ["pattern-grid.ts"], opts({ root: dir, grep }), 5000);
+    assert.equal(section.count, 1);
+    assert.match(section.text, /Definitions of functions called by the changed lines/);
+    assert.match(section.text, /pattern-grid\.ts:5:/);
+    assert.match(section.text, /_invalidateGlobalCursorLayout/);
+    assert.doesNotMatch(section.text, /other\.ts/);
+    const already = `${batch}\n    5 +  private _applyScale(): void {\n    6 +    this._invalidateGlobalCursorLayout();\n    7 +  }`;
+    assert.equal(definitionSection(["_applyScale"], already, ["pattern-grid.ts"], opts({ root: dir, grep }), 5000).text, "");
+    const builder = createContextBuilder("diff --git a/pattern-grid.ts b/pattern-grid.ts\n", opts({ root: dir, grep, maxChars: 8000 }));
+    const text = builder([{ label: "pattern-grid.ts", text: batch }]);
+    assert.match(text, /_invalidateGlobalCursorLayout/);
+    assert.equal(builder.stats[0].definitions, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("contextOptionsFromEnv reads CONTEXT_* and rejects bad values", () => {
   const env = (values: Record<string, string>) => (name: string, fallback = "") => values[name] ?? fallback;
-  const o = contextOptionsFromEnv(env({ CONTEXT_CHARS: "5000", CONTEXT_CALLERS: "2" }), "/r");
-  assert.deepEqual([o.maxChars, o.callersPerSymbol, o.maxSymbols, o.docChars, o.root], [5000, 2, 12, 3000, "/r"]);
+  const o = contextOptionsFromEnv(env({ CONTEXT_CHARS: "5000", CONTEXT_CALLERS: "2", CONTEXT_DEFINITIONS: "4", DEFINITION_LINES: "40" }), "/r");
+  assert.deepEqual(
+    [o.maxChars, o.callersPerSymbol, o.maxSymbols, o.docChars, o.maxDefinitions, o.definitionLines, o.root],
+    [5000, 2, 12, 3000, 4, 40, "/r"],
+  );
   assert.equal(contextOptionsFromEnv(env({ CONTEXT_CHARS: "0" }), "/r").maxChars, 0);
+  assert.equal(contextOptionsFromEnv(env({}), "/r").maxDefinitions, 6);
   assert.throws(() => contextOptionsFromEnv(env({ CONTEXT_CHARS: "lots" }), "/r"), /CONTEXT_CHARS/);
   assert.throws(() => contextOptionsFromEnv(env({ CONTEXT_CALLERS: "-1" }), "/r"), /CONTEXT_CALLERS/);
+  assert.throws(() => contextOptionsFromEnv(env({ DEFINITION_LINES: "-1" }), "/r"), /DEFINITION_LINES/);
 });

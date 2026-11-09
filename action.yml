@@ -78,9 +78,33 @@ inputs:
     required: false
     default: "10"
   context-chars:
-    description: Cap for the reference context added to each review call. 0 turns it off.
+    description: Cap for the reference context added to each review call (overview, guidance, usages, callee bodies). 0 turns it off. This is a checkout lookup, not an embedding index.
     required: false
     default: "12000"
+  context-definitions:
+    description: How many functions called by the changed lines have their bodies read from the checkout. 0 skips that lookup.
+    required: false
+    default: "6"
+  definition-lines:
+    description: Max lines of one callee body included in the reference context.
+    required: false
+    default: "80"
+  refute:
+    description: "'true' to run one disproof pass over findings that would be posted or written into the fix brief. A finding is dropped only on an explicit keep=false with a reason."
+    required: false
+    default: "true"
+  refute-model:
+    description: Optional model for the disproof pass. Leave blank to use the review model.
+    required: false
+    default: ""
+  refute-provider:
+    description: "Optional API protocol for the disproof pass: 'openai' or 'anthropic'. Leave blank to use the review provider."
+    required: false
+    default: ""
+  refute-base-url:
+    description: Optional API root for the disproof pass. Leave blank to use the review base URL (or the provider default when the provider changes).
+    required: false
+    default: ""
   debug-artifacts:
     description: "true to upload findings.json, review-payload.json, fix-brief-targets.json, and scope.txt (they contain code excerpts — keep off unless you need them)."
     required: false
@@ -148,6 +172,12 @@ runs:
         FIX_BRIEF: ${{ inputs.fix-brief }}
         ANCHOR_DIFF_FILE: ${{ runner.temp }}/fixbrief-ai/anchor.diff
         CONTEXT_CHARS: ${{ inputs.context-chars }}
+        CONTEXT_DEFINITIONS: ${{ inputs.context-definitions }}
+        DEFINITION_LINES: ${{ inputs.definition-lines }}
+        REFUTE: ${{ inputs.refute }}
+        LLM_REFUTE_MODEL: ${{ inputs.refute-model }}
+        LLM_REFUTE_PROVIDER: ${{ inputs.refute-provider }}
+        LLM_REFUTE_BASE_URL: ${{ inputs.refute-base-url }}
         PR_TITLE: ${{ github.event.pull_request.title }}
         PR_BODY: ${{ github.event.pull_request.body }}
         PR_NUMBER: ${{ github.event.pull_request.number }}

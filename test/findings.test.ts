@@ -274,6 +274,8 @@ test("parseCategories / filterByCategories allowlist findings; unknown names thr
   assert.doesNotMatch(reviewSystemPrompt("all"), /Category filter:/);
   assert.match(reviewSystemPrompt("all"), /OWASP-class/);
   assert.match(reviewSystemPrompt("all"), /linters, formatters, and dedicated SAST tools/);
+  assert.match(reviewSystemPrompt("all"), /omit the finding instead of grading it high/);
+  assert.match(reviewSystemPrompt("all"), /pseudo-element blocks clicks or hover/);
 });
 
 test("formatFileListFooter tallies reasons and collapses files into a details accordion", () => {

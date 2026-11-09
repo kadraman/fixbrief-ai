@@ -113,7 +113,7 @@ function runReview(baseUrl: string, outDir: string, diffPath: string, extraEnv: 
     const child = spawn(process.execPath, ["--experimental-strip-types", SCRIPT, "--diff", diffPath, "--out-dir", outDir, "--no-fix-brief"], {
       env: engineTestEnv({
         LLM_API_KEY: "test-key", LLM_MODEL: "mock-model", LLM_PROVIDER: "openai", LLM_BASE_URL: baseUrl,
-        LLM_RETRY_DELAY: "0", WORKERS: "1", FIX_BRIEF: "false", LLM_TEMPERATURE: "", CONSISTENCY_RUNS: "1", ...extraEnv,
+        LLM_RETRY_DELAY: "0", WORKERS: "1", FIX_BRIEF: "false", LLM_TEMPERATURE: "", CONSISTENCY_RUNS: "1", REFUTE: "false", ...extraEnv,
       }),
       windowsHide: true,
     });
@@ -271,6 +271,40 @@ test("e2e: a diff with only skipped files still writes an empty findings.json", 
   await scenario(LOCKFILE_DIFF, () => ({ status: 500 }), {}, (r, out) => {
     assert.equal(r.code, 0, r.stderr);
     assert.deepEqual(readFindings(out).findings, []);
+  });
+});
+
+test("e2e: the disproof pass drops an explicit false positive and leaves the other finding posted", async () => {
+  await scenario(DIFF, (_call, body) => {
+    const system = body.messages?.find((m) => m.role === "system")?.content ?? "";
+    if (system.includes("whether code-review findings are real defects")) {
+      return { status: 200, content: JSON.stringify({ verdicts: [
+        { id: "RB1", keep: false, reason: "hits on ::before go to the button" },
+      ] }) };
+    }
+    return { status: 200, content: findingsJson(
+      finding({ title: "pointer events" }),
+      finding({ id: "S2", title: "real bug", line: 4, evidence: "return True" }),
+    ) };
+  }, { REFUTE: "true" }, (r, out, seen) => {
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen.length, 2);
+    const file = readFindings(out);
+    assert.equal(file.refute.status, "ok");
+    assert.equal(file.refute.dropped, 1);
+    const dropped = file.findings.find((s: { title: string }) => s.title === "pointer events");
+    const kept = file.findings.find((s: { title: string }) => s.title === "real bug");
+    assert.equal(dropped.refute.keep, false);
+    assert.equal(dropped.inline, false);
+    assert.equal(kept.refute, undefined);
+    assert.equal(kept.inline, true);
+    const payload = JSON.parse(readFileSync(join(out, "review-payload.json"), "utf8"));
+    assert.equal(payload.comments.length, 1);
+    const bodies = payload.comments.map((c: { body: string }) => c.body).join("\n");
+    assert.match(bodies, /\*\*real bug\*\*/);
+    assert.doesNotMatch(bodies, /pointer events/);
+    assert.doesNotMatch(payload.body, /pointer events/);
+    assert.doesNotMatch(readFileSync(join(out, "review.md"), "utf8"), /pointer events/);
   });
 });
 

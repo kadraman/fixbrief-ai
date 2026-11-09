@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { parseDiffLines } from "./difflines.ts";
 import type { LineMap } from "./difflines.ts";
 
-/** Reference context for the reviewer: other files in the PR, project guidance, and where changed symbols are used. */
+/** Reference context for the reviewer: other files in the PR, project guidance, usages, and callee bodies. */
 export type GrepFn = (symbol: string, root: string, limit: number) => string[];
 
 export interface ContextOptions {
@@ -16,6 +16,10 @@ export interface ContextOptions {
   maxSymbols: number;
   /** Cap for the project-guidance excerpt. 0 disables it. */
   docChars: number;
+  /** Callees whose bodies are read from the checkout. 0 disables definition lookup. */
+  maxDefinitions: number;
+  /** Max lines of one function body included from the checkout. */
+  definitionLines: number;
   /** Repository root (the checkout). */
   root: string;
   /** Injectable for tests; defaults to `git grep`. */
@@ -24,6 +28,7 @@ export interface ContextOptions {
 
 export const DEFAULT_CONTEXT_OPTIONS: Omit<ContextOptions, "root"> = {
   maxChars: 12000, callersPerSymbol: 3, maxSymbols: 12, docChars: 3000,
+  maxDefinitions: 6, definitionLines: 80,
 };
 
 const DOC_CANDIDATES = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md", "CONTRIBUTING.md"];
@@ -127,9 +132,92 @@ export function changedSymbols(annotatedText: string, maxSymbols: number): strin
   return [...seen].slice(0, maxSymbols);
 }
 
+/** A keyword that takes parentheses, so the name is not a callee. `new` starts a constructor, not a dropped side effect. */
+const CALL_PREFIX = /(?:function\*?|class|interface|enum|def|fn|func|struct|trait|catch|if|for|while|switch|typeof|new)\s*$/;
+
+/** Names invoked on `code` (not only added diff lines). Declarations and generic names are dropped. */
+export function calledSymbolsFromCode(code: string, maxSymbols: number): string[] {
+  const seen = new Set<string>();
+  const add = (name: string) => {
+    if (name.length < 4 || GENERIC.has(name.toLowerCase()) || KEYWORDS.has(name)) return;
+    seen.add(name);
+  };
+  for (const line of code.split("\n")) {
+    const declared = new Set(identifiersFromDeclaration(line));
+    const call = /([A-Za-z_$][\w$]*)\s*\(/g;
+    for (let match = call.exec(line); match; match = call.exec(line)) {
+      if (declared.has(match[1]) || CALL_PREFIX.test(line.slice(0, match.index))) continue;
+      add(match[1]);
+      if (seen.size >= maxSymbols) return [...seen];
+    }
+  }
+  return [...seen];
+}
+
+/** Callees on added lines of an ANNOTATED diff piece, capped and filtered like {@link changedSymbols}. */
+export function calledSymbols(annotatedText: string, maxSymbols: number): string[] {
+  const added: string[] = [];
+  for (const line of annotatedText.split("\n")) {
+    const code = annotatedCode(line);
+    if (code?.kind === "added") added.push(code.code);
+  }
+  return calledSymbolsFromCode(added.join("\n"), maxSymbols);
+}
+
+/** True when `code` declares `symbol` (function, method, class, or const binding), not merely calls it. */
+export function isDefinitionLine(symbol: string, code: string): boolean {
+  if (identifiersFromDeclaration(code).includes(symbol)) return true;
+  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:function\\*?|class|def|fn|func)\\s+${escaped}\\b|(?:const|let|var|val)\\s+${escaped}\\b`).test(code);
+}
+
+/** Join `file` onto `root` and reject paths that escape the checkout. */
+export function safeRepoPath(root: string, file: string): string | null {
+  if (!file || file.includes("\0") || isAbsolute(file)) return null;
+  const abs = join(root, file);
+  const rel = relative(root, abs);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
+  return abs;
+}
+
+function codeForBraces(line: string): string {
+  const noLineComment = line.replace(/\/\/.*$/, "");
+  return noLineComment.replace(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`/g, "''");
+}
+
+/** Lines of a definition starting at `startLine` (1-based), through the matching closing brace, capped at `maxLines`. */
+export function sliceDefinition(fileText: string, startLine: number, maxLines: number): string {
+  const lines = fileText.split(/\r?\n/);
+  const start = Math.max(0, startLine - 1);
+  if (start >= lines.length || maxLines <= 0) return "";
+  const collected: string[] = [];
+  let depth = 0;
+  let seenOpen = false;
+  for (let i = start; i < lines.length && collected.length < maxLines; i++) {
+    const line = lines[i];
+    collected.push(line);
+    for (const ch of codeForBraces(line)) {
+      if (ch === "{") { depth++; seenOpen = true; }
+      else if (ch === "}") depth = Math.max(0, depth - 1);
+    }
+    if (seenOpen && depth === 0) break;
+  }
+  return collected.join("\n");
+}
+
+function definedInBatch(symbol: string, annotatedText: string): boolean {
+  for (const line of annotatedText.split("\n")) {
+    const annotated = annotatedCode(line);
+    const code = annotated ? annotated.code : line.replace(/^@@ [^@]*@@\s*/, "");
+    if (isDefinitionLine(symbol, code)) return true;
+  }
+  return false;
+}
+
 const gitGrep: GrepFn = (symbol, root, limit) => {
   try {
-    const out = execFileSync("git", ["grep", "-n", "-w", "-F", "-I", "--no-color", "--max-count", "10", "-e", symbol],
+    const count = String(Math.min(Math.max(limit, 1), 200));
+    const out = execFileSync("git", ["grep", "-n", "-w", "-F", "-I", "--no-color", "--max-count", count, "-e", symbol],
       { cwd: root, encoding: "utf8", timeout: 10_000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
     return out.split("\n").filter(Boolean).slice(0, limit);
   } catch { return []; } // not a repo, no matches (exit 1), timeout: all mean "no context"
@@ -159,7 +247,58 @@ export function usageSection(symbols: string[], visible: LineMap, options: Conte
   return { text: blocks.length ? `### Other usages of symbols changed here (checked-out tree; line numbers approximate)\n${blocks.join("\n")}` : "", hits };
 }
 
-export interface BatchContextStat { files: string[]; chars: number; symbols: number; hits: number }
+function piecePath(label: string): string {
+  return label.replace(/ \(part \d+\/\d+\)$/, "");
+}
+
+function pickDefinition(symbol: string, rows: string[], prefer: Set<string>): { path: string; line: number } | null {
+  const found: { path: string; line: number; preferred: boolean }[] = [];
+  for (const row of rows) {
+    const match = /^(.+?):(\d+):(.*)$/.exec(row);
+    if (!match || NOISE_PATH.test(match[1]) || !isDefinitionLine(symbol, match[3])) continue;
+    found.push({ path: match[1], line: Number(match[2]), preferred: prefer.has(match[1]) });
+  }
+  found.sort((a, b) => Number(b.preferred) - Number(a.preferred) || a.line - b.line);
+  return found[0] ? { path: found[0].path, line: found[0].line } : null;
+}
+
+/**
+ * Bodies of functions the changed lines call, read from the checkout.
+ * Skips a symbol already defined in this batch. Line numbers are approximate.
+ */
+export function definitionSection(
+  symbols: string[], batchText: string, preferPaths: string[], options: ContextOptions, maxChars: number,
+): { text: string; count: number } {
+  const definitionLines = options.definitionLines ?? DEFAULT_CONTEXT_OPTIONS.definitionLines;
+  if (maxChars <= 0 || definitionLines <= 0 || !symbols.length) return { text: "", count: 0 };
+  const grep = options.grep ?? gitGrep;
+  const prefer = new Set(preferPaths);
+  const header = "### Definitions of functions called by the changed lines (checked-out tree; line numbers approximate)";
+  const blocks: string[] = [];
+  let used = header.length + 1;
+  for (const symbol of symbols) {
+    if (definedInBatch(symbol, batchText)) continue;
+    let hit: { path: string; line: number } | null = null;
+    try { hit = pickDefinition(symbol, grep(symbol, options.root, 80), prefer); }
+    catch { hit = null; }
+    if (!hit) continue;
+    const abs = safeRepoPath(options.root, hit.path);
+    if (!abs || !existsSync(abs)) continue;
+    let body = "";
+    try { body = sliceDefinition(readFileSync(abs, "utf8"), hit.line, definitionLines); }
+    catch { body = ""; }
+    if (!body.trim()) continue;
+    const numbered = body.split("\n").map((line, index) => `  ${hit.line + index}: ${line}`).join("\n");
+    const block = `\`${symbol}\` at ${hit.path}:${hit.line}:\n${numbered}`;
+    if (used + block.length + 1 > maxChars) break;
+    blocks.push(block);
+    used += block.length + 1;
+  }
+  if (!blocks.length) return { text: "", count: 0 };
+  return { text: `${header}\n${blocks.join("\n")}`, count: blocks.length };
+}
+
+export interface BatchContextStat { files: string[]; chars: number; symbols: number; hits: number; definitions: number }
 export interface ContextBuilder { (batch: { label: string; text: string }[]): string; stats: BatchContextStat[] }
 
 /**
@@ -179,12 +318,21 @@ export function createContextBuilder(rawDiff: string, options: ContextOptions, p
         guidance: readProjectGuidance(options.root, Math.min(options.docChars, Math.floor(options.maxChars / 3))),
         visible: parseDiffLines(rawDiff),
       };
-      const symbols = changedSymbols(batch.map((p) => p.text).join("\n"), options.maxSymbols);
+      const batchText = batch.map((p) => p.text).join("\n");
+      const symbols = changedSymbols(batchText, options.maxSymbols);
+      const maxDefinitions = options.maxDefinitions ?? DEFAULT_CONTEXT_OPTIONS.maxDefinitions;
+      const callees = maxDefinitions > 0 ? calledSymbols(batchText, maxDefinitions) : [];
       const fixed = [shared.overview, shared.guidance].filter(Boolean);
       const budget = Math.max(0, options.maxChars - fixed.join("\n\n").length - 2);
-      const usage = usageSection(symbols, shared.visible, options, budget);
-      const text = [...fixed, usage.text].filter(Boolean).join("\n\n").slice(0, options.maxChars);
-      stats.push({ files: batch.map((p) => p.label), chars: text.length, symbols: symbols.length, hits: usage.hits });
+      const definitionBudget = callees.length ? Math.max(0, Math.floor(budget * 0.6)) : 0;
+      const definitions = definitionSection(callees, batchText, batch.map((p) => piecePath(p.label)), options, definitionBudget);
+      const usageBudget = Math.max(0, budget - (definitions.text ? definitions.text.length + 2 : 0));
+      const usage = usageSection(symbols, shared.visible, options, usageBudget);
+      const text = [...fixed, definitions.text, usage.text].filter(Boolean).join("\n\n").slice(0, options.maxChars);
+      stats.push({
+        files: batch.map((p) => p.label), chars: text.length, symbols: symbols.length,
+        hits: usage.hits, definitions: definitions.count,
+      });
       return text;
     } catch { return ""; }
   };
@@ -215,5 +363,7 @@ export function contextOptionsFromEnv(env: (name: string, fallback?: string) => 
     callersPerSymbol: int("CONTEXT_CALLERS", DEFAULT_CONTEXT_OPTIONS.callersPerSymbol),
     maxSymbols: int("CONTEXT_SYMBOLS", DEFAULT_CONTEXT_OPTIONS.maxSymbols),
     docChars: int("CONTEXT_DOC_CHARS", DEFAULT_CONTEXT_OPTIONS.docChars),
+    maxDefinitions: int("CONTEXT_DEFINITIONS", DEFAULT_CONTEXT_OPTIONS.maxDefinitions),
+    definitionLines: int("DEFINITION_LINES", DEFAULT_CONTEXT_OPTIONS.definitionLines),
   };
 }

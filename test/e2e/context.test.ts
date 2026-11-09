@@ -42,7 +42,7 @@ function runEngine(baseUrl: string, cwd: string, args: string[], extraEnv: Recor
       cwd,
       env: engineTestEnv({
         LLM_API_KEY: "k", LLM_MODEL: "m", LLM_PROVIDER: "openai", LLM_BASE_URL: baseUrl, LLM_RETRY_DELAY: "0",
-        WORKERS: "1", FIX_BRIEF: "false", LLM_TEMPERATURE: "", CONSISTENCY_RUNS: "", CONTEXT_CHARS: "", ...extraEnv,
+        WORKERS: "1", FIX_BRIEF: "false", LLM_TEMPERATURE: "", CONSISTENCY_RUNS: "", CONTEXT_CHARS: "", REFUTE: "false", ...extraEnv,
       }),
       windowsHide: true,
     });
@@ -123,6 +123,43 @@ test("e2e: outside a git repository the review still runs, with the overview onl
       assert.doesNotMatch(seen[0].user, /is also used at/);
     });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("e2e: reference context includes the body of a function an added line calls", async () => {
+  const lines = [
+    "export class PatternGrid {",
+    "  private _onWindowResize = () => {",
+    "    this._applyScale();",
+    "  };",
+    ...Array.from({ length: 40 }, () => "  // padding"),
+    "  private _applyScale(): void {",
+    "    content.style.width = '1px';",
+    "    this._invalidateGlobalCursorLayout();",
+    "    this._syncRangeDom();",
+    "  }",
+    "}",
+  ];
+  const repo = makeRepo({ "pattern-grid.ts": `${lines.join("\n")}\n` });
+  const diff = [
+    "diff --git a/pattern-grid.ts b/pattern-grid.ts", "index 111..222 100644", "--- a/pattern-grid.ts", "+++ b/pattern-grid.ts",
+    "@@ -1,4 +1,4 @@ export class PatternGrid {",
+    " export class PatternGrid {",
+    "   private _onWindowResize = () => {",
+    "-    this._invalidateGlobalCursorLayout();",
+    "+    this._applyScale();",
+    "   };",
+  ].join("\n");
+  try {
+    writeFileSync(join(repo, "pr.diff"), diff);
+    await withMock(empty, async (baseUrl, seen) => {
+      const r = await runEngine(baseUrl, repo, ["--diff", "pr.diff", "--out-dir", "out"]);
+      assert.equal(r.code, 0, r.stderr);
+      assert.match(seen[0].user, /Definitions of functions called by the changed lines/);
+      assert.match(seen[0].user, /_invalidateGlobalCursorLayout/);
+      assert.match(seen[0].system, /omit the finding instead of grading it high/);
+      assert.ok(findingsJson(repo).contextStats[0].definitions >= 1);
+    });
+  } finally { rmSync(repo, { recursive: true, force: true }); }
 });
 
 test("e2e: with --anchor-diff, lines outside GitHub's PR diff are not anchored even if the reviewed diff shows them", async () => {
