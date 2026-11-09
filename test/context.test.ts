@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { annotateDiff, parseDiffLines } from "../src/difflines.ts";
 import {
   calledSymbols, changedSymbols, contextOptionsFromEnv, createContextBuilder, definitionSection, isDefinitionLine,
-  readProjectGuidance, sliceDefinition, summarizeDiff, usageSection,
+  readProjectGuidance, safeRepoPath, sliceDefinition, summarizeDiff, usageSection,
 } from "../src/context.ts";
 import type { ContextOptions } from "../src/context.ts";
 
@@ -166,6 +166,27 @@ test("definitionSection includes a callee body from the checkout and skips one a
     assert.match(text, /_invalidateGlobalCursorLayout/);
     assert.equal(builder.stats[0].definitions, 1);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("safeRepoPath rejects a symlink that resolves outside the checkout", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ctx-safe-"));
+  const outside = mkdtempSync(join(tmpdir(), "ctx-outside-"));
+  try {
+    writeFileSync(join(dir, "inside.ts"), "export const inside = 1;\n");
+    writeFileSync(join(outside, "secret.txt"), "secret\n");
+    symlinkSync(join(outside, "secret.txt"), join(dir, "leak.ts"));
+    symlinkSync(join(dir, "inside.ts"), join(dir, "alias.ts"));
+    const inside = realpathSync(join(dir, "inside.ts"));
+    assert.equal(safeRepoPath(dir, "inside.ts"), inside);
+    assert.equal(safeRepoPath(dir, "alias.ts"), inside);
+    assert.equal(safeRepoPath(dir, "leak.ts"), null);
+    assert.equal(safeRepoPath(dir, "../secret.txt"), null);
+    assert.equal(safeRepoPath(dir, "/etc/passwd"), null);
+    assert.equal(safeRepoPath(dir, "missing.ts"), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
 });
 
 test("contextOptionsFromEnv reads CONTEXT_* and rejects bad values", () => {

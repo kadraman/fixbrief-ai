@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { parseDiffLines } from "./difflines.ts";
 import type { LineMap } from "./difflines.ts";
@@ -171,13 +171,23 @@ export function isDefinitionLine(symbol: string, code: string): boolean {
   return new RegExp(`(?:function\\*?|class|def|fn|func)\\s+${escaped}\\b|(?:const|let|var|val)\\s+${escaped}\\b`).test(code);
 }
 
-/** Join `file` onto `root` and reject paths that escape the checkout. */
+function staysInside(root: string, abs: string): boolean {
+  const rel = relative(root, abs);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/** Join `file` onto `root` and reject paths that escape the checkout, including through a symlink. */
 export function safeRepoPath(root: string, file: string): string | null {
   if (!file || file.includes("\0") || isAbsolute(file)) return null;
   const abs = join(root, file);
-  const rel = relative(root, abs);
-  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
-  return abs;
+  if (!staysInside(root, abs)) return null;
+  try {
+    const resolved = realpathSync(abs);
+    if (!staysInside(realpathSync(root), resolved)) return null;
+    return resolved;
+  } catch {
+    return null;
+  }
 }
 
 function codeForBraces(line: string): string {
