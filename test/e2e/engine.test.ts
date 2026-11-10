@@ -241,8 +241,34 @@ test("e2e: a model that rejects 'temperature' is retried once without it", async
     assert.equal(seen.length, 2);
     assert.equal(seen[0].temperature, 0);
     assert.equal(seen[1].temperature, undefined);
-    assert.match(r.stderr, /retrying without it/);
+    assert.match(r.stderr, /rejected temperature/);
     assert.equal(readFindings(out).findings.length, 1);
+  });
+});
+
+test("e2e: a temperature rejection is remembered for later calls", async () => {
+  await scenario(DIFF, (_call, body) => body.temperature !== undefined
+    ? { status: 400, message: "temperature is not supported for this model" }
+    : { status: 200, content: findingsJson(finding()) }, { CONSISTENCY_RUNS: "2" }, (r, _out, seen) => {
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(seen[0].temperature, 0);
+    assert.equal(seen[1].temperature, undefined);
+    assert.ok(seen.length >= 3);
+    assert.ok(seen.slice(2).every((body) => body.temperature === undefined));
+    assert.equal(r.stderr.split("rejected temperature").length - 1, 1);
+  });
+});
+
+test("e2e: gpt-5 models omit temperature instead of retrying", async () => {
+  await scenario(DIFF, () => ({ status: 200, content: findingsJson(finding()) }), {
+    LLM_MODEL: "gpt-5-mini", CONSISTENCY_RUNS: "2",
+  }, (r, _out, seen) => {
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(seen.length >= 2);
+    assert.ok(seen.every((body) => body.temperature === undefined));
+    assert.match(r.stdout, /Temperature omitted: gpt-5-mini/);
+    assert.match(r.stdout, /each run uses the same request/);
+    assert.doesNotMatch(r.stderr, /rejected temperature/);
   });
 });
 

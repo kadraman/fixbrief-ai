@@ -84,6 +84,29 @@ function envInt(name: string, fallback: number): number {
 }
 function sleep(ms: number): Promise<void> { return new Promise((resolveSleep) => setTimeout(resolveSleep, ms)); }
 
+/**
+ * OpenAI reasoning models reject `temperature` (gpt-5*, o1, o3, o4, including
+ * dated and vendor-prefixed ids such as openai/gpt-5-mini). Sampling stays at
+ * the provider default, so sending the parameter only produces a 400 per call.
+ */
+export function modelOmitsTemperature(model: string): boolean {
+  const bare = model.trim().toLowerCase().split("/").pop() ?? "";
+  return /^(gpt-5|o[0-9])([.\-]|$)/.test(bare);
+}
+
+/** Requested temperature, or `none` when this model does not accept the parameter. */
+export function temperatureForModel(model: string, requested: string): string {
+  return modelOmitsTemperature(model) ? "none" : requested;
+}
+
+/** Set after a model we did not recognise rejects temperature, so later calls skip it. */
+let omitTemperatureLearned = false;
+
+function includeTemperature(model: string, temperature: string): boolean {
+  if (omitTemperatureLearned || modelOmitsTemperature(model)) return false;
+  return Boolean(temperature) && temperature.toLowerCase() !== "none";
+}
+
 async function chat(provider: string, model: string, key: string, baseUrl: string,
   temperature: string, maxOut: number, retryDelay: number, system: string, user: string): Promise<string> {
   const anthropic = provider === "anthropic";
@@ -102,7 +125,7 @@ async function chat(provider: string, model: string, key: string, baseUrl: strin
       ...(useMaxCompletionTokens ? { max_completion_tokens: maxOut } : { max_tokens: maxOut }),
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
     };
-  if (temperature && temperature.toLowerCase() !== "none") body.temperature = Number(temperature);
+  if (includeTemperature(model, temperature)) body.temperature = Number(temperature);
   // DeepSeek-compatible thinking control (ignored by providers that do not support it).
   const thinking = env("LLM_THINKING").toLowerCase();
   if (!anthropic && (thinking === "disabled" || thinking === "enabled")) {
@@ -122,8 +145,11 @@ async function chat(provider: string, model: string, key: string, baseUrl: strin
         const detail = (await response.text()).slice(0, 300);
         last = `HTTP ${response.status}: ${detail}`;
         if (response.status === 400 && "temperature" in body && /temperature/i.test(detail)) {
-          delete body.temperature; // this model rejects the parameter: retry at once without it, without using up an attempt
-          console.warn("Model rejected 'temperature'; retrying without it.");
+          delete body.temperature; // retry this call at once, without using up an attempt
+          if (!omitTemperatureLearned) {
+            omitTemperatureLearned = true;
+            console.warn(`${model} rejected temperature; omitting it for the rest of this review.`);
+          }
           attempt--;
           continue;
         }
@@ -509,17 +535,25 @@ async function main(): Promise<number> {
   const key = env("LLM_API_KEY"), model = env("LLM_MODEL");
   if (!key) throw new Error("LLM_API_KEY is not set (secrets are not available to PRs from forks)");
   if (!model) throw new Error("LLM_MODEL is not set");
+  const requestedTemperature = env("LLM_TEMPERATURE", "0");
+  const temperature = temperatureForModel(model, requestedTemperature);
   const config: LlmConfig = { provider, model, args: [provider, model, key,
-    env("LLM_BASE_URL", DEFAULT_BASE[provider]), env("LLM_TEMPERATURE", "0"),
+    env("LLM_BASE_URL", DEFAULT_BASE[provider]), temperature,
     envInt("LLM_MAX_OUTPUT_TOKENS", 8192), Number(env("LLM_RETRY_DELAY", "3"))] };
   console.log(`${pieces.length} diff pieces -> ${batches.length} batch(es) [${provider}, ${model}]`);
+  if (modelOmitsTemperature(model)) {
+    console.log(`Temperature omitted: ${model} does not accept that parameter.`);
+  }
   if (categories !== "all") {
     console.log(`Categories: ${categoriesLabel(categories)} (others will be dropped).`);
   }
   const runCount = Math.min(Math.max(envInt("CONSISTENCY_RUNS", 2), 1), 5);
-  const consistencyTemperature = env("CONSISTENCY_TEMPERATURE", "0.4");
+  const consistencyTemperature = temperatureForModel(model, env("CONSISTENCY_TEMPERATURE", "0.4"));
   if (runCount > 1) {
-    console.log(`Consistency runs: ${runCount} (extra runs use temperature ${consistencyTemperature}); agreement adjusts confidence, and one-off medium findings stay out of the fix brief.`);
+    const sampling = consistencyTemperature === "none"
+      ? "each run uses the same request"
+      : `extra runs use temperature ${consistencyTemperature}`;
+    console.log(`Consistency runs: ${runCount} (${sampling}); agreement adjusts confidence, and one-off medium findings stay out of the fix brief.`);
   }
   const runOutcomes: Outcome[][] = [];
   for (let run = 0; run < runCount; run++) {
