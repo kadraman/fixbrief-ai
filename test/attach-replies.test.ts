@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   appendBriefDownloadLink, attachReportBack, briefDownloadBlock, matchCommentIds,
-  renderReportBackSection, reportBackItem,
+  overviewIssueComment, renderReportBackSection, reportBackItem, toPendingReviewPayload,
 } from "../src/attach-replies.ts";
 import { findingMarker, type FixBriefTargetsFile } from "../src/findings.ts";
 
@@ -82,6 +82,32 @@ test("attachReportBack appends and replaces the Report back section", () => {
   assert.equal(text.split("## Report back").length, 2);
   assert.match(text, /\/comments\/99\/replies/);
   assert.doesNotMatch(text, /\/comments\/55\/replies/);
+});
+
+test("toPendingReviewPayload omits event so GitHub leaves the review pending", () => {
+  const empty = toPendingReviewPayload({ comments: [] });
+  assert.deepEqual(empty, {});
+  assert.equal("event" in empty, false);
+  assert.equal("body" in empty, false);
+  const withComments = toPendingReviewPayload({
+    comments: [{ path: "a.ts", line: 4, side: "RIGHT", body: "note" }],
+  });
+  assert.equal("event" in withComments, false);
+  assert.equal(withComments.comments?.length, 1);
+  assert.equal(withComments.comments?.[0].path, "a.ts");
+});
+
+test("overviewIssueComment includes the download link and inline findings", () => {
+  const text = overviewIssueComment({
+    body: "## Review\n\nHello.",
+    comments: [{ path: "a.ts", line: 4, side: "RIGHT", body: "Check this." }],
+  }, "https://example.com/fix-brief.md");
+  assert.match(text, /\[download fix-brief\.md\]\(https:\/\/example\.com\/fix-brief\.md\)/);
+  assert.match(text, /`a\.ts:4`/);
+  assert.match(text, /Check this\./);
+  const plain = overviewIssueComment({ body: "Hello.\n", comments: [] });
+  assert.equal(plain, "Hello.\n");
+  assert.doesNotMatch(plain, /download fix-brief/);
 });
 
 test("appendBriefDownloadLink adds usage instructions and does not duplicate", () => {

@@ -8,6 +8,7 @@ import {
   parseFindingMarker,
   type FixBriefTarget,
   type FixBriefTargetsFile,
+  type GitHubReviewPayload,
 } from "./findings.ts";
 
 export interface ReviewCommentRef {
@@ -164,6 +165,35 @@ export function briefDownloadBlock(url: string): string {
 export function appendBriefDownloadLink(body: string, url: string): string {
   if (body.includes(`[download fix-brief.md](${url})`)) return body;
   return `${body.trimEnd()}\n\n${briefDownloadBlock(url)}\n`;
+}
+
+/**
+ * Body for creating a review that stays pending until it is submitted.
+ * Create-review accepts APPROVE, REQUEST_CHANGES, and COMMENT. Omitting `event`
+ * leaves the review PENDING. The string "PENDING" is not in that enum and
+ * returns HTTP 422, which drops the later submit that carries the download link.
+ * The overview is sent on submit, once the artifact URL exists.
+ */
+export function toPendingReviewPayload(
+  payload: Pick<GitHubReviewPayload, "comments">,
+): { comments?: GitHubReviewPayload["comments"] } {
+  if (!payload.comments?.length) return {};
+  return { comments: payload.comments };
+}
+
+/** Issue-comment fallback: overview (with the download link when a URL is known) plus any inline findings. */
+export function overviewIssueComment(
+  payload: Pick<GitHubReviewPayload, "body" | "comments">,
+  briefUrl = "",
+): string {
+  const overview = briefUrl
+    ? appendBriefDownloadLink(payload.body, briefUrl).trimEnd()
+    : payload.body.trimEnd();
+  const parts = [overview];
+  for (const comment of payload.comments ?? []) {
+    parts.push("", "---", "", `**\`${comment.path}:${comment.line}\`**`, "", comment.body);
+  }
+  return `${parts.join("\n")}\n`;
 }
 
 function readJson<T>(path: string): T {

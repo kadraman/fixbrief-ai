@@ -1,6 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { packBatches, splitBatchForRetry, splitDiff } from "../src/fixbrief-ai.ts";
+import { modelOmitsTemperature, packBatches, splitBatchForRetry, splitDiff, temperatureForModel } from "../src/fixbrief-ai.ts";
+
+test("modelOmitsTemperature matches reasoning models and leaves sampling models alone", () => {
+  for (const model of ["gpt-5-mini", "gpt-5", "gpt-5.1", "GPT-5-nano", "openai/gpt-5-mini", "o1", "o1-mini", "o3-mini", "o4-mini"]) {
+    assert.equal(modelOmitsTemperature(model), true, model);
+    assert.equal(temperatureForModel(model, "0"), "none");
+  }
+  for (const model of ["gpt-4o", "gpt-4.1-mini", "gpt-4o-mini", "claude-sonnet-4-5", "mock-model", "deepseek-v4-pro"]) {
+    assert.equal(modelOmitsTemperature(model), false, model);
+    assert.equal(temperatureForModel(model, "0.4"), "0.4");
+  }
+});
 
 test("splitDiff force-splits files above piece-chars even when under batch-chars", () => {
   const hunk = Array.from({ length: 80 }, (_, i) => `+line_${i}_xxxxxxxxxxxxxxxxxxxxxxxx`).join("\n");

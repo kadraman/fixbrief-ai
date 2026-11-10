@@ -99,7 +99,7 @@ Use `actions/checkout` with `fetch-depth: 0` (as in the example) so very large d
 | OpenRouter | `openai` | router model id | `https://openrouter.ai/api/v1` |
 | Ollama (self-hosted runner) | `openai` | local model name | `http://localhost:11434/v1` |
 
-**Recommended default:** `gpt-5-mini` via OpenAI (`LLM_PROVIDER=openai`, leave `LLM_BASE_URL` unset, `LLM_TEMPERATURE=none`). Model names change often — check your provider's docs. If you previously pointed `LLM_BASE_URL` at DeepSeek/OpenRouter/Ollama and switch back to OpenAI, clear that variable; a leftover override sends requests to the wrong host.
+**Recommended default:** `gpt-5-mini` via OpenAI (`LLM_PROVIDER=openai`, leave `LLM_BASE_URL` unset). gpt-5 and o-series models omit `temperature` on their own. Model names change often — check your provider's docs. If you previously pointed `LLM_BASE_URL` at DeepSeek/OpenRouter/Ollama and switch back to OpenAI, clear that variable; a leftover override sends requests to the wrong host.
 
 ### Action inputs
 
@@ -109,8 +109,8 @@ Use `actions/checkout` with `fetch-depth: 0` (as in the example) so very large d
 | `model` | required | model name (recommended: `gpt-5-mini`) |
 | `provider` | `openai` | `openai` or `anthropic` |
 | `base-url` | | API root override; leave blank for OpenAI |
-| `temperature` | `0` | sampling temperature; set to `none` to omit the parameter (recommended for `gpt-5*`) |
-| `consistency-runs` | `2` | independent review passes (1–5); later runs use `CONSISTENCY_TEMPERATURE` (default `0.4`). Agreement adjusts confidence scores. Critical/high that clear `minimum-confidence` still publish even if seen in only one run; one-off medium findings stay out of the fix brief |
+| `temperature` | `0` | sampling temperature. gpt-5 and o-series models omit it. Set to `none` to omit it for any other model |
+| `consistency-runs` | `2` | independent review passes (1–5); later runs use `CONSISTENCY_TEMPERATURE` (default `0.4`), unless the model omits temperature, in which case each run uses the same request. Agreement adjusts confidence scores. Critical/high that clear `minimum-confidence` still publish even if seen in only one run; one-off medium findings stay out of the fix brief |
 | `max-output-tokens` | `8192` | required by the Anthropic API |
 | `batch-chars` | `100000` | max diff characters packed per API call (~25k tokens); lower it for small-context models |
 | `piece-chars` | `20000` | max characters per file piece before hunk-splitting; large files are split even when under `batch-chars` |
@@ -215,7 +215,7 @@ Limitations: batches are reviewed independently, so problems that span files in 
 | `LLM_API_KEY is not set` | Secret missing, or the PR is from a fork (secrets aren't available) |
 | `LLM_MODEL is not set` | Add the `LLM_MODEL` repository variable |
 | `HTTP 404` / `model not found` | Wrong model name or `LLM_BASE_URL` |
-| `HTTP 400` mentioning `temperature` | The engine retries once without it; set `temperature` to `none` to omit it from the start |
+| `HTTP 400` mentioning `temperature` | gpt-5 and o-series models omit it from the start. Any other model is retried once without it, and later calls in that review omit it too |
 | `HTTP 429` repeatedly | Lower `workers`, or raise your provider's rate limit |
 | `Review failed for this part` in the comment | That batch errored after retries; the files are named in the message |
 | Context-length errors | Lower `batch-chars` |
