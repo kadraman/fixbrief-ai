@@ -84,14 +84,25 @@ function envInt(name: string, fallback: number): number {
 }
 function sleep(ms: number): Promise<void> { return new Promise((resolveSleep) => setTimeout(resolveSleep, ms)); }
 
+/** Last path segment, so `openai/gpt-6.1-terra` and `gpt-6.1-terra` share one id. */
+function bareModelId(model: string): string {
+  return model.trim().toLowerCase().split("/").pop() ?? "";
+}
+
 /**
- * OpenAI reasoning models reject `temperature` (gpt-5*, o1, o3, o4, including
- * dated and vendor-prefixed ids such as openai/gpt-5-mini). Sampling stays at
- * the provider default, so sending the parameter only produces a 400 per call.
+ * Models that reject `temperature` on a normal Chat Completions call.
+ * gpt-5* and o-series reject it outright. gpt-6* defaults to a reasoning effort
+ * other than `none` (or does not support `none`), and that effort rejects
+ * temperature. This client does not send `reasoning_effort`, so the provider
+ * default applies. Dated and vendor-prefixed ids are included.
  */
 export function modelOmitsTemperature(model: string): boolean {
-  const bare = model.trim().toLowerCase().split("/").pop() ?? "";
-  return /^(gpt-5|o[0-9])([.\-]|$)/.test(bare);
+  return /^(gpt-5|gpt-6|o[0-9])([.\-]|$)/.test(bareModelId(model));
+}
+
+/** Chat Completions token cap: gpt-5, gpt-6, and o-series require max_completion_tokens. */
+function usesMaxCompletionTokens(model: string): boolean {
+  return /^(gpt-5|gpt-6|o[0-9])/.test(bareModelId(model));
 }
 
 /** Requested temperature, or `none` when this model does not accept the parameter. */
@@ -116,8 +127,8 @@ async function chat(provider: string, model: string, key: string, baseUrl: strin
     ? { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" }
     : { "content-type": "application/json", authorization: `Bearer ${key}` };
   headers["user-agent"] = `fixbrief-ai/${VERSION}`;
-  // GPT-5 / o-series Chat Completions expect max_completion_tokens; older OpenAI-compatible APIs use max_tokens.
-  const useMaxCompletionTokens = !anthropic && /^(gpt-5|o[0-9])/i.test(model);
+  // gpt-5, gpt-6, and o-series Chat Completions expect max_completion_tokens; older APIs use max_tokens.
+  const useMaxCompletionTokens = !anthropic && usesMaxCompletionTokens(model);
   const body: Record<string, unknown> = anthropic
     ? { model, max_tokens: maxOut, system, messages: [{ role: "user", content: user }] }
     : {

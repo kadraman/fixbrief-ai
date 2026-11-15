@@ -168,21 +168,31 @@ test("definitionSection includes a callee body from the checkout and skips one a
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("safeRepoPath rejects a symlink that resolves outside the checkout", () => {
+test("safeRepoPath rejects a symlink that resolves outside the checkout", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ctx-safe-"));
   const outside = mkdtempSync(join(tmpdir(), "ctx-outside-"));
   try {
     writeFileSync(join(dir, "inside.ts"), "export const inside = 1;\n");
     writeFileSync(join(outside, "secret.txt"), "secret\n");
-    symlinkSync(join(outside, "secret.txt"), join(dir, "leak.ts"));
-    symlinkSync(join(dir, "inside.ts"), join(dir, "alias.ts"));
     const inside = realpathSync(join(dir, "inside.ts"));
     assert.equal(safeRepoPath(dir, "inside.ts"), inside);
-    assert.equal(safeRepoPath(dir, "alias.ts"), inside);
-    assert.equal(safeRepoPath(dir, "leak.ts"), null);
     assert.equal(safeRepoPath(dir, "../secret.txt"), null);
     assert.equal(safeRepoPath(dir, "/etc/passwd"), null);
     assert.equal(safeRepoPath(dir, "missing.ts"), null);
+    let symlinks = true;
+    try {
+      symlinkSync(join(outside, "secret.txt"), join(dir, "leak.ts"));
+      symlinkSync(join(dir, "inside.ts"), join(dir, "alias.ts"));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // Windows refuses file symlinks unless Developer Mode or an elevated shell is on.
+      if (code !== "EPERM" && code !== "EACCES") throw error;
+      symlinks = false;
+      t.diagnostic("symlink creation is not permitted; skipping the symlink cases");
+    }
+    if (!symlinks) return;
+    assert.equal(safeRepoPath(dir, "alias.ts"), inside);
+    assert.equal(safeRepoPath(dir, "leak.ts"), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(outside, { recursive: true, force: true });

@@ -4,7 +4,7 @@
 #
 # Expects Settings > Secrets and variables > Actions:
 #   Secret    LLM_API_KEY
-#   Variable  LLM_MODEL      (required; recommended gpt-5-mini)
+#   Variable  LLM_MODEL      (required; recommended gpt-6.1-terra)
 #   Variable  LLM_PROVIDER   (optional; default openai)
 #   Variable  LLM_BASE_URL   (optional; leave unset for OpenAI)
 #   Variable  LLM_REFUTE_MODEL (optional; stronger model for the disproof pass only)

@@ -34,7 +34,12 @@ const findingsJson = (...findings: unknown[]) => JSON.stringify({ findings });
 
 type BatchMode = "partial-fail" | "all-prose";
 type Reply = { status: number; content?: string; message?: string };
-type RequestBody = { temperature?: number; messages?: { role: string; content: string }[] };
+type RequestBody = {
+  temperature?: number;
+  max_tokens?: number;
+  max_completion_tokens?: number;
+  messages?: { role: string; content: string }[];
+};
 
 function partNumber(body: string): number {
   const match = /This is part (\d+) of/.exec(body);
@@ -268,6 +273,20 @@ test("e2e: gpt-5 models omit temperature instead of retrying", async () => {
     assert.ok(seen.every((body) => body.temperature === undefined));
     assert.match(r.stdout, /Temperature omitted: gpt-5-mini/);
     assert.match(r.stdout, /each run uses the same request/);
+    assert.doesNotMatch(r.stderr, /rejected temperature/);
+  });
+});
+
+test("e2e: gpt-6.1-terra omits temperature and uses max_completion_tokens", async () => {
+  await scenario(DIFF, () => ({ status: 200, content: findingsJson(finding()) }), {
+    LLM_MODEL: "gpt-6.1-terra", CONSISTENCY_RUNS: "1", LLM_MAX_OUTPUT_TOKENS: "8192",
+  }, (r, _out, seen) => {
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(seen.length >= 1);
+    assert.equal(seen[0].temperature, undefined);
+    assert.equal(seen[0].max_tokens, undefined);
+    assert.equal(seen[0].max_completion_tokens, 8192);
+    assert.match(r.stdout, /Temperature omitted: gpt-6.1-terra/);
     assert.doesNotMatch(r.stderr, /rejected temperature/);
   });
 });
