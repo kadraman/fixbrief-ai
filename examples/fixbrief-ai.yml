@@ -2,7 +2,7 @@
 #
 # Settings > Secrets and variables > Actions:
 #   Secret    LLM_API_KEY    your provider's API key
-#   Variable  LLM_MODEL      model name (required; recommended gpt-5-mini)
+#   Variable  LLM_MODEL      model name (required; recommended gpt-6.1-terra)
 #   Variable  LLM_PROVIDER   "openai" (default) or "anthropic"
 #   Variable  LLM_BASE_URL   leave unset for OpenAI; set for DeepSeek/OpenRouter/etc.
 #

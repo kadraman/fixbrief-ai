@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { modelOmitsTemperature, packBatches, splitBatchForRetry, splitDiff, temperatureForModel } from "../src/fixbrief-ai.ts";
 
 test("modelOmitsTemperature matches reasoning models and leaves sampling models alone", () => {
-  for (const model of ["gpt-5-mini", "gpt-5", "gpt-5.1", "GPT-5-nano", "openai/gpt-5-mini", "o1", "o1-mini", "o3-mini", "o4-mini"]) {
+  for (const model of ["gpt-5-mini", "gpt-5", "gpt-5.1", "GPT-5-nano", "openai/gpt-5-mini", "gpt-6.1-terra", "openai/gpt-6.1-terra", "gpt-6-luna", "gpt-6.1-sol", "o1", "o1-mini", "o3-mini", "o4-mini"]) {
     assert.equal(modelOmitsTemperature(model), true, model);
     assert.equal(temperatureForModel(model, "0"), "none");
   }

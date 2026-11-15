@@ -38,7 +38,7 @@ examples/fixbrief-ai.yml   workflow that uses the action
 You need the [GitHub CLI](https://cli.github.com) (`gh auth login` done), Node.js 22.6+, and an API key.
 
 ```bash
-cp .env.example .env        # then fill in LLM_API_KEY (LLM_MODEL defaults to gpt-5-mini)
+cp .env.example .env        # then fill in LLM_API_KEY (LLM_MODEL defaults to gpt-6.1-terra)
 
 # See how the diff would be split, without calling any LLM (no key needed):
 scripts/review-pr.sh 123 --repo OWNER/NAME --dry-run
@@ -82,7 +82,7 @@ node --experimental-strip-types src/fixbrief-ai.ts --diff my.diff --dry-run
    | Name | Type | Notes |
    |---|---|---|
    | `LLM_API_KEY` | Secret | your provider's API key |
-   | `LLM_MODEL` | Variable | required; recommended default `gpt-5-mini` |
+   | `LLM_MODEL` | Variable | required; recommended default `gpt-6.1-terra` |
    | `LLM_PROVIDER` | Variable | `openai` (default) or `anthropic` |
    | `LLM_BASE_URL` | Variable | leave unset for OpenAI; set for DeepSeek/OpenRouter/etc. |
 2. Copy `examples/fixbrief-ai.yml` to `.github/workflows/fixbrief-ai.yml` and replace `kadraman/fixbrief-ai@v1` with your action reference.
@@ -93,23 +93,23 @@ Use `actions/checkout` with `fetch-depth: 0` (as in the example) so very large d
 
 | Provider | `LLM_PROVIDER` | `LLM_MODEL` (example) | `LLM_BASE_URL` |
 |---|---|---|---|
-| OpenAI (recommended) | `openai` | `gpt-5-mini` | *(blank)* |
+| OpenAI (recommended) | `openai` | `gpt-6.1-terra` | *(blank)* |
 | Claude | `anthropic` | provider model id | *(blank)* |
 | DeepSeek | `openai` | e.g. `deepseek-v4-pro` | `https://api.deepseek.com` |
 | OpenRouter | `openai` | router model id | `https://openrouter.ai/api/v1` |
 | Ollama (self-hosted runner) | `openai` | local model name | `http://localhost:11434/v1` |
 
-**Recommended default:** `gpt-5-mini` via OpenAI (`LLM_PROVIDER=openai`, leave `LLM_BASE_URL` unset). gpt-5 and o-series models omit `temperature` on their own. Model names change often — check your provider's docs. If you previously pointed `LLM_BASE_URL` at DeepSeek/OpenRouter/Ollama and switch back to OpenAI, clear that variable; a leftover override sends requests to the wrong host.
+**Recommended default:** `gpt-6.1-terra` via OpenAI (`LLM_PROVIDER=openai`, leave `LLM_BASE_URL` unset). OpenAI shuts down `gpt-5-mini` on 11 December 2026 and lists `gpt-6.1-terra` as its replacement. It still uses Chat Completions. gpt-5, gpt-6, and o-series models omit `temperature` on their own. Model names change often — check your provider's docs. If you previously pointed `LLM_BASE_URL` at DeepSeek/OpenRouter/Ollama and switch back to OpenAI, clear that variable; a leftover override sends requests to the wrong host.
 
 ### Action inputs
 
 | Input | Default | Meaning |
 |---|---|---|
 | `api-key` | required | provider API key |
-| `model` | required | model name (recommended: `gpt-5-mini`) |
+| `model` | required | model name (recommended: `gpt-6.1-terra`) |
 | `provider` | `openai` | `openai` or `anthropic` |
 | `base-url` | | API root override; leave blank for OpenAI |
-| `temperature` | `0` | sampling temperature. gpt-5 and o-series models omit it. Set to `none` to omit it for any other model |
+| `temperature` | `0` | sampling temperature. gpt-5, gpt-6, and o-series models omit it. Set to `none` to omit it for any other model |
 | `consistency-runs` | `2` | independent review passes (1–5); later runs use `CONSISTENCY_TEMPERATURE` (default `0.4`), unless the model omits temperature, in which case each run uses the same request. Agreement adjusts confidence scores. Critical/high that clear `minimum-confidence` still publish even if seen in only one run; one-off medium findings stay out of the fix brief |
 | `max-output-tokens` | `8192` | required by the Anthropic API |
 | `batch-chars` | `100000` | max diff characters packed per API call (~25k tokens); lower it for small-context models |
@@ -215,7 +215,7 @@ Limitations: batches are reviewed independently, so problems that span files in 
 | `LLM_API_KEY is not set` | Secret missing, or the PR is from a fork (secrets aren't available) |
 | `LLM_MODEL is not set` | Add the `LLM_MODEL` repository variable |
 | `HTTP 404` / `model not found` | Wrong model name or `LLM_BASE_URL` |
-| `HTTP 400` mentioning `temperature` | gpt-5 and o-series models omit it from the start. Any other model is retried once without it, and later calls in that review omit it too |
+| `HTTP 400` mentioning `temperature` | gpt-5, gpt-6, and o-series models omit it from the start. Any other model is retried once without it, and later calls in that review omit it too |
 | `HTTP 429` repeatedly | Lower `workers`, or raise your provider's rate limit |
 | `Review failed for this part` in the comment | That batch errored after retries; the files are named in the message |
 | Context-length errors | Lower `batch-chars` |
