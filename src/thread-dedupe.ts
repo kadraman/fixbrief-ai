@@ -1,8 +1,8 @@
 /** Drop review comments that already have an unresolved thread with the same fingerprint. */
 
 import {
-  checklistCovers, findingMarker, fingerprintMarker, mergeChecklistBody, parseFindingMarker, parseFingerprintMarker,
-  rewriteGeneratedCommentCount, threadBaseFingerprint, threadKeyPath,
+  checklistCovers, findingMarker, fingerprintMarker, matchByLocation, mergeChecklistBody, parseFindingMarker,
+  parseFingerprintMarker, rewriteGeneratedCommentCount, threadBaseFingerprint, threadKeyPath,
   type ChecklistItem, type GitHubReviewPayload,
 } from "./findings.ts";
 
@@ -64,28 +64,86 @@ function newest(threads: ExistingThread[]): ExistingThread | undefined {
   }, undefined);
 }
 
+function threadBaseOf(thread: ExistingThread, bases?: Set<string>): string | undefined {
+  if (thread.path) {
+    const title = titleFromBody(thread.body);
+    if (title !== "Finding") return threadBaseFingerprint({ file: thread.path, title });
+  }
+  const marker = parseFingerprintMarker(thread.body);
+  if (marker && bases?.has(marker)) return marker;
+  return undefined;
+}
+
+function hasLine(line: number | null | undefined): line is number {
+  return typeof line === "number";
+}
+
+interface ThreadClaim {
+  id: string;
+  fingerprint: string;
+  base: string;
+  path: string;
+  line?: number;
+  title: string;
+  findingId: string;
+  body: string;
+}
+
 /**
- * Match a finding to an unresolved trusted thread.
- * An older review identified the first same-title finding by file and title alone.
- * That thread is reused only when its path and line are this finding's path and line.
+ * Match findings to unresolved trusted threads.
+ * The same fingerprint wins first. A line shift still matches the thread at
+ * GitHub's current line for that file and title, and same-title findings are
+ * paired to different threads. A legacy file comment, which has no line, matches
+ * a new file comment on that path.
  */
-export function reusableThread(
+function assignOpenThreads(
+  claims: ThreadClaim[],
   threads: ExistingThread[],
   actor: string | undefined,
-  fingerprint: string,
-  base: string | undefined,
-  location?: { path?: string; line?: number },
-): ExistingThread | undefined {
-  const trusted = threads.filter((thread) => !thread.resolved && isTrustedThread(thread, actor));
-  const exact = trusted.filter((thread) => parseFingerprintMarker(thread.body) === fingerprint);
-  if (exact.length) return newest(exact);
-  if (!base || !location?.path || location.line === undefined) return undefined;
-  const legacy = trusted.filter((thread) => {
-    if (parseFingerprintMarker(thread.body) !== base) return false;
-    if (!thread.path || thread.line === undefined || thread.line === null) return false;
-    return threadKeyPath(thread.path) === threadKeyPath(location.path!) && thread.line === location.line;
-  });
-  return newest(legacy);
+): Map<string, ExistingThread> {
+  const bases = new Set(claims.map((claim) => claim.base));
+  const trusted = threads.filter((thread) => !thread.resolved && isTrustedThread(thread, actor) && parseFingerprintMarker(thread.body));
+  const used = new Set<number>();
+  const assigned = new Map<string, ExistingThread>();
+  for (const claim of claims) {
+    const exact = newest(trusted.filter((thread) => !used.has(thread.commentId) && parseFingerprintMarker(thread.body) === claim.fingerprint));
+    if (!exact) continue;
+    used.add(exact.commentId);
+    assigned.set(claim.id, exact);
+  }
+  const lineClaims = claims.filter((claim) => !assigned.has(claim.id) && hasLine(claim.line));
+  const lineThreads = trusted.filter((thread) => !used.has(thread.commentId) && hasLine(thread.line) && threadBaseOf(thread, bases));
+  const pairs = matchByLocation(
+    lineClaims.map((claim) => ({ id: claim.id, base: claim.base, line: claim.line })),
+    lineThreads.map((thread) => ({ id: String(thread.commentId), base: threadBaseOf(thread, bases)!, line: thread.line ?? undefined })),
+  );
+  for (const claim of lineClaims) {
+    const thread = lineThreads.find((item) => String(item.commentId) === pairs.get(claim.id)?.id);
+    if (!thread) continue;
+    used.add(thread.commentId);
+    assigned.set(claim.id, thread);
+  }
+  const fileThreads = new Map<string, ExistingThread[]>();
+  for (const thread of trusted) {
+    if (used.has(thread.commentId) || hasLine(thread.line)) continue;
+    const base = threadBaseOf(thread, bases);
+    if (!base || !thread.path) continue;
+    const list = fileThreads.get(base) ?? [];
+    list.push(thread);
+    fileThreads.set(base, list);
+  }
+  for (const list of fileThreads.values()) list.sort((a, b) => b.commentId - a.commentId);
+  for (const claim of claims) {
+    if (assigned.has(claim.id) || hasLine(claim.line)) continue;
+    const list = fileThreads.get(claim.base);
+    if (!list) continue;
+    const index = list.findIndex((thread) => thread.path && threadKeyPath(thread.path) === threadKeyPath(claim.path));
+    if (index < 0) continue;
+    const [thread] = list.splice(index, 1);
+    used.add(thread.commentId);
+    assigned.set(claim.id, thread);
+  }
+  return assigned;
 }
 
 function stillOpenBlock(reused: ReusedThread[], repo?: string, pr?: string): string {
@@ -121,54 +179,49 @@ export function dedupeThreads(
   existingChecklist?: ExistingChecklist,
   link?: { repo?: string; pr?: string; actor?: string },
 ): DedupeResult {
-  const reused: ReusedThread[] = [];
-  const seenReused = new Set<number>();
-  const keep = <T extends { body: string; path: string; line?: number }>(comments: T[]): T[] => {
-    const kept: T[] = [];
-    for (const comment of comments) {
-      const fingerprint = parseFingerprintMarker(comment.body);
-      const title = titleFromBody(comment.body);
-      const base = fingerprint && title !== "Finding"
-        ? threadBaseFingerprint({ file: comment.path, title })
-        : undefined;
-      const existing = fingerprint
-        ? reusableThread(threads, link?.actor, fingerprint, base, { path: comment.path, line: comment.line })
-        : undefined;
-      if (!existing || !fingerprint) { kept.push(comment); continue; }
-      if (!seenReused.has(existing.commentId)) {
-        seenReused.add(existing.commentId);
-        reused.push({
-          id: existing.commentId,
-          body: comment.body,
-          findingId: parseFindingMarker(comment.body) ?? "",
-          fingerprint,
-          title: titleFromBody(comment.body),
-        });
-      }
-      // A second finding with the same fingerprint is the same thread. Do not checklist it.
-    }
-    return kept;
+  const claims: ThreadClaim[] = [];
+  const addComment = (kind: string, comment: { body: string; path: string; line?: number }, index: number) => {
+    const fingerprint = parseFingerprintMarker(comment.body);
+    const title = titleFromBody(comment.body);
+    if (!fingerprint || title === "Finding") return;
+    claims.push({
+      id: `${kind}:${index}`,
+      fingerprint,
+      base: threadBaseFingerprint({ file: comment.path, title }),
+      path: comment.path,
+      line: comment.line,
+      title,
+      findingId: parseFindingMarker(comment.body) ?? "",
+      body: comment.body,
+    });
   };
-  const comments = keep(payload.comments);
-  const fileComments = keep(payload.fileComments ?? []);
-  const checklist = (payload.checklist ?? []).filter((item) => {
-    const existing = reusableThread(
-      threads, link?.actor, item.fingerprint, threadBaseFingerprint(item),
-      { path: item.file, line: item.line },
-    );
-    if (!existing) return true;
-    if (!seenReused.has(existing.commentId)) {
-      seenReused.add(existing.commentId);
-      reused.push({
-        id: existing.commentId,
-        body: `${findingMarker(item.id)}\n${fingerprintMarker(item.fingerprint)}\n${item.title}`,
-        findingId: item.id,
-        fingerprint: item.fingerprint,
-        title: item.title,
-      });
-    }
-    return false;
-  });
+  payload.comments.forEach((comment, index) => addComment("line", comment, index));
+  (payload.fileComments ?? []).forEach((comment, index) => addComment("file", comment, index));
+  (payload.checklist ?? []).forEach((item, index) => claims.push({
+    id: `check:${index}`,
+    fingerprint: item.fingerprint,
+    base: threadBaseFingerprint(item),
+    path: item.file,
+    line: item.line,
+    title: item.title,
+    findingId: item.id,
+    body: `${findingMarker(item.id)}\n${fingerprintMarker(item.fingerprint)}\n${item.title}`,
+  }));
+  const assigned = assignOpenThreads(claims, threads, link?.actor);
+  const reused: ReusedThread[] = [];
+  const reusedIds = new Set<string>();
+  for (const claim of claims) {
+    const thread = assigned.get(claim.id);
+    if (!thread || reusedIds.has(claim.id)) continue;
+    reusedIds.add(claim.id);
+    reused.push({
+      id: thread.commentId, body: claim.body, findingId: claim.findingId, fingerprint: claim.fingerprint, title: claim.title,
+    });
+  }
+  const taken = new Set(assigned.keys());
+  const comments = payload.comments.filter((_, index) => !taken.has(`line:${index}`));
+  const fileComments = (payload.fileComments ?? []).filter((_, index) => !taken.has(`file:${index}`));
+  const checklist = (payload.checklist ?? []).filter((_, index) => !taken.has(`check:${index}`));
   const covered = checklistCovers(existingChecklist?.body, checklist);
   const checklistAction: DedupeResult["checklistAction"] = checklist.length === 0 || covered
     ? "skip"

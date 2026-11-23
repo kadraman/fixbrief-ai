@@ -77,6 +77,35 @@ test("removing one same-title finding still reuses the other finding's thread", 
   assert.equal(primaryResult.reused[0].id, 1);
 });
 
+test("a finding whose line moved reuses its thread, and same-title findings stay apart", () => {
+  const moved = githubReviewPayload([
+    sig({ id: "A", line: 12, title: "Shared", confidence: 0.99 }) as any,
+    sig({ id: "B", line: 32, title: "Shared", confidence: 0.9 }) as any,
+  ], 0.85);
+  const at = (line: number) => threadFingerprint({ file: "a.py", title: "Shared", line });
+  const result = dedupeThreads(moved, [
+    { commentId: 10, resolved: false, author: "github-actions", path: "a.py", line: 10, body: `**Shared**\n\n${fingerprintMarker(at(10))}` },
+    { commentId: 30, resolved: false, author: "github-actions", path: "a.py", line: 30, body: `**Shared**\n\n${fingerprintMarker(at(30))}` },
+  ], undefined, { actor: "github-actions" });
+  assert.equal(result.payload.comments.length, 0);
+  assert.deepEqual(result.reused.map((item) => item.id).sort((a, b) => a - b), [10, 30]);
+  const swapped = result.reused.find((item) => item.findingId === "A");
+  assert.equal(swapped?.id, 10);
+  assert.equal(result.reused.find((item) => item.findingId === "B")?.id, 30);
+});
+
+test("a legacy file comment with no line is reused for the same path and title", () => {
+  const payload = githubReviewPayload([], 0.85, Number.POSITIVE_INFINITY, undefined, [], false, {}, 0.75, [
+    sig({ title: "Off hunk", line: 80 }) as any,
+  ]);
+  const base = threadBaseFingerprint({ file: "a.py", title: "Off hunk" });
+  const result = dedupeThreads(payload, [{
+    commentId: 44, resolved: false, author: "github-actions", path: "a.py", body: fingerprintMarker(base),
+  }], undefined, { actor: "github-actions" });
+  assert.equal(result.payload.fileComments.length, 0);
+  assert.equal(result.reused[0].id, 44);
+});
+
 test("a matching fingerprint from another author is not reused", () => {
   const payload = githubReviewPayload([sig({ title: "Trust" }) as any], 0.85);
   const fingerprint = payload.comments[0].body.match(/fixbrief-ai-fp:([^\s>]+)/)?.[1]!;

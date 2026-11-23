@@ -125,7 +125,7 @@ export function threadBaseFingerprint(finding: { file: string; title: string }):
   return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
-/** Stable id for one finding. The line is included, so rank and sibling findings do not change it. */
+/** Stable id for one finding. The line keeps same-title findings apart; reuse across a line shift is decided at match time. */
 export function threadFingerprint(finding: { file: string; title: string; line?: number }): string {
   const line = finding.line !== undefined ? `\0${finding.line}` : "";
   const key = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}${line}`;
@@ -955,14 +955,94 @@ export function renderChecklistBody(items: ChecklistItem[]): string {
   ].join("\n");
 }
 
-const CHECKLIST_ITEM_MARKER = /<!--\s*fixbrief-ai-item:([^\s>]+)\s*-->/g;
+export interface LocationRef {
+  id: string;
+  /** File and title identity. Line shifts stay in the same group. */
+  base: string;
+  line?: number;
+}
+
+/**
+ * Pair items that share a file and title. Each side is used once.
+ * The closest lines are paired first, so an insertion above several findings
+ * keeps each one with its own existing entry.
+ */
+export function matchByLocation<T extends LocationRef, U extends LocationRef>(current: T[], existing: U[]): Map<string, U> {
+  const result = new Map<string, U>();
+  const groups = new Map<string, { current: T[]; existing: U[] }>();
+  for (const item of current) {
+    const group = groups.get(item.base) ?? { current: [], existing: [] };
+    group.current.push(item);
+    groups.set(item.base, group);
+  }
+  for (const item of existing) {
+    const group = groups.get(item.base);
+    if (group) group.existing.push(item);
+  }
+  for (const group of groups.values()) {
+    const left = [...group.current];
+    const right = [...group.existing];
+    while (left.length && right.length) {
+      let bestI = -1, bestJ = -1, bestCost = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < left.length; i++) {
+        if (left[i].line === undefined) continue;
+        for (let j = 0; j < right.length; j++) {
+          if (right[j].line === undefined) continue;
+          const cost = Math.abs((left[i].line as number) - (right[j].line as number));
+          if (cost < bestCost) { bestCost = cost; bestI = i; bestJ = j; }
+        }
+      }
+      if (bestI < 0) break;
+      result.set(left[bestI].id, right[bestJ]);
+      left.splice(bestI, 1);
+      right.splice(bestJ, 1);
+    }
+  }
+  return result;
+}
+
+interface ParsedChecklistEntry {
+  fingerprint: string;
+  file: string;
+  line: number;
+  title: string;
+}
+
+function parseChecklistEntries(body: string): ParsedChecklistEntry[] {
+  const entries: ParsedChecklistEntry[] = [];
+  const re = /####\s+\w+:\s+(.+)\n+\s*`([^`\n]+):(\d+)(?:-\d+)?`[\s\S]*?<!--\s*fixbrief-ai-item:([^\s>]+)\s*-->/g;
+  for (const match of body.matchAll(re)) {
+    entries.push({ title: match[1].trim(), file: match[2], line: Number(match[3]), fingerprint: match[4] });
+  }
+  return entries;
+}
+
+/** Checklist items that are not already in the comment, even if a line shift changed their fingerprint. */
+export function checklistItemsToAppend(existing: string | undefined, items: ChecklistItem[]): ChecklistItem[] {
+  if (!existing?.includes(CHECKLIST_MARKER)) return items;
+  const entries = parseChecklistEntries(existing);
+  const used = new Set<string>();
+  const pending: ChecklistItem[] = [];
+  for (const item of items) {
+    const exact = entries.find((entry) => entry.fingerprint === item.fingerprint && !used.has(entry.fingerprint));
+    if (exact) { used.add(exact.fingerprint); continue; }
+    pending.push(item);
+  }
+  const pairs = matchByLocation(
+    pending.map((item) => ({ id: item.fingerprint, base: threadBaseFingerprint(item), line: item.line })),
+    entries.filter((entry) => !used.has(entry.fingerprint)).map((entry) => ({
+      id: entry.fingerprint,
+      base: threadBaseFingerprint({ file: entry.file, title: entry.title }),
+      line: entry.line,
+    })),
+  );
+  return pending.filter((item) => !pairs.has(item.fingerprint));
+}
 
 /** Append findings that are not already in the comment. Existing text, including agent notes, is kept. */
 export function mergeChecklistBody(existing: string | undefined, items: ChecklistItem[]): string {
   if (!existing?.includes(CHECKLIST_MARKER)) return renderChecklistBody(items);
-  const present = new Set<string>();
-  for (const match of existing.matchAll(CHECKLIST_ITEM_MARKER)) present.add(match[1]);
-  const missing = items.filter((item) => !present.has(item.fingerprint));
+  const missing = checklistItemsToAppend(existing, items);
   if (!missing.length) return `${existing.trimEnd()}\n`;
   return `${existing.trimEnd()}\n\n${missing.map(renderChecklistItem).join("\n\n")}\n`;
 }
@@ -1017,9 +1097,7 @@ export function mergeChecklistReport(current: string, edited: string, original =
 export function checklistCovers(existing: string | undefined, items: ChecklistItem[]): boolean {
   if (!items.length) return true;
   if (!existing?.includes(CHECKLIST_MARKER)) return false;
-  const present = new Set<string>();
-  for (const match of existing.matchAll(CHECKLIST_ITEM_MARKER)) present.add(match[1]);
-  return items.every((item) => present.has(item.fingerprint));
+  return checklistItemsToAppend(existing, items).length === 0;
 }
 
 /** Replace the overview's "generated N comments" count after threads are dropped as duplicates. */

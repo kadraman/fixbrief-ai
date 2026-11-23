@@ -494,6 +494,21 @@ test("mergeChecklistBody appends new items and keeps text the agent already wrot
   assert.equal(mergeChecklistBody(merged, [first, second]), `${merged.trimEnd()}\n`);
 });
 
+test("a checklist item whose line moved reuses the existing entry", () => {
+  const original = checklistItemFromFinding(sig({ id: "RB1", title: "Moved", file: "a.py", line: 10 }) as any);
+  const existing = mergeChecklistBody(undefined, [original]).replace(
+    "<what you fixed, or why you skipped this finding>",
+    "Already reported.",
+  );
+  const shifted = checklistItemFromFinding(sig({ id: "RB2", title: "Moved", file: "a.py", line: 12 }) as any);
+  const other = checklistItemFromFinding(sig({ id: "RB3", title: "Other", file: "a.py", line: 40 }) as any);
+  const merged = mergeChecklistBody(existing, [shifted, other]);
+  assert.match(merged, /Already reported\./);
+  assert.equal(merged.split("fixbrief-ai-item:").length, 3);
+  assert.match(merged, /#### high: Other/);
+  assert.equal(mergeChecklistBody(merged, [shifted]), `${merged.trimEnd()}\n`);
+});
+
 test("mergeChecklistReport keeps the download link and later checklist edits", () => {
   const first = checklistItemFromFinding(sig({ id: "RB1", title: "First", file: "a.py", line: 1 }) as any);
   const later = checklistItemFromFinding(sig({ id: "RB9", title: "Later", file: "c.py", line: 3 }) as any);
