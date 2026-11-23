@@ -45,7 +45,11 @@ test("anchorFindings: valid, invalid line, valid range, cross-hunk range drops s
     sig({ line: 2, endLine: 4, suggestion: "x" }), sig({ line: 5, endLine: 21, suggestion: "y" }), sig({ file: "./a.py", line: 22 }),
   ] as any, m);
   assert.equal(r.anchored.length, 4);
-  assert.equal(r.unanchored.length, 2);
+  assert.equal(r.fileLevel.length, 1);
+  assert.equal(r.fileLevel[0].line, 99);
+  assert.equal(r.fileLevel[0].suggestion, undefined);
+  assert.equal(r.unanchored.length, 1);
+  assert.equal(r.unanchored[0].file, "nope.py");
   assert.equal(r.anchored[1].endLine, 4);
   assert.equal(r.anchored[2].endLine, undefined);
   assert.equal(r.anchored[2].suggestion, undefined);

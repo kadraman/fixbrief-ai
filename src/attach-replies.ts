@@ -5,7 +5,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  parseFindingMarker,
+  parseFindingMarker, parseFingerprintMarker, reportMarker, threadFingerprint,
   type FixBriefTarget,
   type FixBriefTargetsFile,
   type GitHubReviewPayload,
@@ -24,6 +24,8 @@ export interface ReportBackOptions {
   comments: ReviewCommentRef[];
   /** Artifact URL, if already known. The review body includes it when the review is submitted. */
   briefUrl?: string;
+  /** The single checklist issue comment, when this run has findings that are not review threads. */
+  checklist?: { id?: number; body: string };
 }
 
 export interface ReportBackItem {
@@ -32,21 +34,32 @@ export interface ReportBackItem {
   command: string;
 }
 
-/** Match targets to posted review comments by the hidden <!-- fixbrief-ai:id --> marker. */
+function targetFingerprint(target: FixBriefTarget): string {
+  return target.fingerprint || threadFingerprint(target);
+}
+
+function isChecklistTarget(target: FixBriefTarget): boolean {
+  if (target.placement === "checklist") return true;
+  if (target.placement === "thread") return false;
+  return !target.inline;
+}
+
+/** Match targets to review comments by fingerprint, then by the hidden finding-id marker. */
 export function matchCommentIds(
   targets: FixBriefTarget[],
   comments: ReviewCommentRef[],
 ): Map<string, number> {
+  const byFingerprint = new Map<string, number>();
   const byId = new Map<string, number>();
   for (const comment of comments) {
+    const fingerprint = parseFingerprintMarker(comment.body);
     const findingId = parseFindingMarker(comment.body);
-    if (!findingId || byId.has(findingId)) continue;
-    byId.set(findingId, comment.id);
+    if (fingerprint && !byFingerprint.has(fingerprint)) byFingerprint.set(fingerprint, comment.id);
+    if (findingId && !byId.has(findingId)) byId.set(findingId, comment.id);
   }
-  // Only return ids for targets we care about (keeps the map focused).
   const matched = new Map<string, number>();
   for (const target of targets) {
-    const id = byId.get(target.id);
+    const id = byFingerprint.get(targetFingerprint(target)) ?? byId.get(target.id);
     if (id !== undefined) matched.set(target.id, id);
   }
   return matched;
@@ -67,10 +80,27 @@ function replyBodyPlaceholder(target: FixBriefTarget): string {
     `**${target.title}** (\`${locationOf(target)}\`)`,
     "",
     "<what you fixed, or why you skipped this finding>",
+    "",
+    reportMarker(targetFingerprint(target)),
   ].join("\n");
 }
 
-/** Build one report-back command for a finding (thread reply when possible). */
+/** Reply on a review thread once. A second run of the same brief sees the report marker and skips. */
+export function threadReplyCommand(
+  repo: string, pr: string, commentId: number, body: string, fingerprint: string,
+): string {
+  const marker = reportMarker(fingerprint);
+  return [
+    `MARKER=${shellSingleQuote(marker)}`,
+    `if gh api --paginate "repos/${repo}/pulls/${pr}/comments/${commentId}/replies" --jq '.[].body' | grep -F -q "$MARKER"; then`,
+    `  echo "already reported on review comment ${commentId}"`,
+    "else",
+    `  gh api --method POST "repos/${repo}/pulls/${pr}/comments/${commentId}/replies" -f body=${shellSingleQuote(body)}`,
+    "fi",
+  ].join("\n");
+}
+
+/** Build one report-back command for a threaded finding. */
 export function reportBackItem(
   target: FixBriefTarget,
   commentId: number | undefined,
@@ -82,48 +112,50 @@ export function reportBackItem(
     return {
       target,
       commentId,
-      command: `gh api --method POST repos/${repo}/pulls/${pr}/comments/${commentId}/replies -f body=${shellSingleQuote(body)}`,
+      command: threadReplyCommand(repo, pr, commentId, body, targetFingerprint(target)),
     };
   }
-  const prComment = [
-    `### ${target.severity}: ${target.title}`,
-    "",
-    `\`${locationOf(target)}\``,
-    "",
-    "<what you fixed, or why you skipped this finding>",
-  ].join("\n");
-  return {
-    target,
-    command: `gh pr comment ${pr} --repo ${repo} --body ${shellSingleQuote(prComment)}`,
-  };
+  return { target, command: "" };
+}
+
+function checklistCommand(
+  repo: string, pr: string, checklist: { id?: number; body: string },
+): string {
+  if (checklist.id) {
+    return `gh api --method PATCH "repos/${repo}/issues/comments/${checklist.id}" -f body=${shellSingleQuote(checklist.body)}`;
+  }
+  return `gh pr comment ${pr} --repo ${repo} --body ${shellSingleQuote(checklist.body)}`;
 }
 
 /** Markdown section appended to fix-brief.md with concrete gh reply commands. */
 export function renderReportBackSection(
   targetsFile: FixBriefTargetsFile,
   comments: ReviewCommentRef[],
+  checklist?: { id?: number; body: string },
 ): string {
   const matched = matchCommentIds(targetsFile.targets, comments);
-  const items = targetsFile.targets.map((target) =>
-    reportBackItem(target, matched.get(target.id), targetsFile.repo, targetsFile.pr));
+  const threads = targetsFile.targets.filter((target) => !isChecklistTarget(target));
+  const checklistTargets = targetsFile.targets.filter(isChecklistTarget);
   const lines = [
     "",
     "## Report back",
     "",
-    "After you finish (or skip) each finding above, post a short note on the pull request.",
-    "Prefer the thread-reply command when a comment id is listed; otherwise use the PR comment command.",
-    "Replace the placeholder text with what you actually did.",
+    "After you finish (or skip) each finding above, report back using only the commands in this section.",
+    "Reply on the matching review thread when a comment id is listed. When a checklist comment is listed, edit that one comment.",
+    "Replace the placeholder text with what you actually did. Run each command at most once.",
+    "Do not open any other pull request comment.",
     "",
   ];
-  if (!items.length) {
+  if (!threads.length && !checklistTargets.length) {
     lines.push("_No findings to report back on._", "");
     return lines.join("\n");
   }
-  items.forEach((item, index) => {
-    const { target, commentId } = item;
+  threads.forEach((target, index) => {
+    const commentId = matched.get(target.id);
+    const item = reportBackItem(target, commentId, targetsFile.repo, targetsFile.pr);
     const where = commentId !== undefined
       ? `reply on review comment \`${commentId}\``
-      : "new pull request comment (no inline thread)";
+      : "no review thread was posted. Do not open a new pull request comment for this finding.";
     lines.push(
       `### ${index + 1}. ${target.title}`,
       "",
@@ -131,18 +163,52 @@ export function renderReportBackSection(
       `- **Severity:** ${target.severity}`,
       `- **How to comment:** ${where}`,
       "",
+    );
+    if (item.command) {
+      lines.push("```bash", item.command, "```", "");
+    }
+  });
+  const unmatchedThreads = threads.filter((target) => !matched.has(target.id));
+  const showChecklist = checklistTargets.length > 0 || (Boolean(checklist?.body) && unmatchedThreads.length > 0);
+  if (showChecklist) {
+    const body = checklist?.body?.trim()
+      ? checklist.body
+      : [
+        "### FixBrief findings without a review thread",
+        "",
+        "Edit this comment. Do not open a new pull request comment.",
+        "",
+        ...checklistTargets.map((target) => [
+          `#### ${target.severity}: ${target.title}`,
+          "",
+          `\`${locationOf(target)}\``,
+          "",
+          "<what you fixed, or why you skipped this finding>",
+        ].join("\n")),
+        "",
+      ].join("\n");
+    const lead = unmatchedThreads.length && checklistTargets.length === 0
+      ? "Review threads could not be posted. Report every finding by editing this one comment. Edit the placeholders, then run the command once."
+      : checklist?.id
+        ? `These findings share one pull request comment (\`${checklist.id}\`). Edit the placeholders in the command, then run it once.`
+        : "These findings are not on review threads. The command posts one pull request comment for all of them. Edit the placeholders, then run it once.";
+    lines.push(
+      "### Checklist",
+      "",
+      lead,
+      "",
       "```bash",
-      item.command,
+      checklistCommand(targetsFile.repo, targetsFile.pr, { id: checklist?.id, body }),
       "```",
       "",
     );
-  });
+  }
   return lines.join("\n");
 }
 
 /** Append (or replace) the Report back section on a fix brief. */
 export function attachReportBack(options: ReportBackOptions): string {
-  const section = renderReportBackSection(options.targets, options.comments);
+  const section = renderReportBackSection(options.targets, options.comments, options.checklist);
   let brief = readFileSync(options.briefPath, "utf8");
   const marker = "\n## Report back\n";
   const idx = brief.indexOf(marker);
@@ -157,8 +223,14 @@ export function briefDownloadBlock(url: string): string {
   return [
     `**Fix brief for an AI assistant:** [download fix-brief.md](${url})`,
     "",
-    "Download `fix-brief.md`, check out this pull request's branch, and give the file to a coding assistant (Cursor, Copilot, Claude Code, or similar). It lists each finding to verify before changing code, the smallest fix, and how to comment back on this pull request.",
+    "Download `fix-brief.md`, check out this pull request's branch, and give the file to a coding assistant (Cursor, Copilot, Claude Code, or similar). It lists each finding to verify before changing code, the smallest fix, and how to reply on the review thread (or the one checklist comment).",
   ].join("\n");
+}
+
+/** Link the single checklist issue comment from the review overview. */
+export function appendChecklistLink(body: string, url: string): string {
+  if (body.includes(url)) return body;
+  return `${body.trimEnd()}\n\n**Findings without a review thread:** [checklist comment](${url})\n`;
 }
 
 /** Append the fix-brief download link (and usage instructions) to a review overview body. */
@@ -205,8 +277,8 @@ function usage(): never {
   node --experimental-strip-types src/attach-replies.ts \\
     --brief PATH --targets PATH [--comments PATH] [--out PATH]
 
-  --comments PATH   JSON array of {id, body, path?, line?} from the posted review
-                    (omit or use an empty array when no review was posted)
+  --comments PATH     JSON array of {id, body, path?, line?} from posted and reused review comments
+  --checklist PATH    JSON {id?, body} for the single checklist issue comment
 `);
   process.exit(0);
 }
@@ -238,7 +310,17 @@ async function main(): Promise<number> {
   const comments: ReviewCommentRef[] = args.comments && existsSync(args.comments)
     ? readJson<ReviewCommentRef[]>(args.comments)
     : [];
-  const brief = attachReportBack({ briefPath: args.brief, targets, comments });
+  const checklist = args.checklist && existsSync(args.checklist)
+    ? readJson<{ id?: number; body?: string }>(args.checklist)
+    : undefined;
+  const brief = attachReportBack({
+    briefPath: args.brief,
+    targets,
+    comments,
+    checklist: checklist && (checklist.id || checklist.body)
+      ? { id: checklist.id, body: checklist.body ?? "" }
+      : undefined,
+  });
   if (args.out) writeFileSync(args.out, brief);
   console.log(`Attached report-back for ${targets.targets.length} finding(s) (${comments.length} review comment(s) matched against).`);
   return 0;

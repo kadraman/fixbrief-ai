@@ -87,13 +87,14 @@ GH_REPO=()
 [ -z "$REPO" ] || GH_REPO=(--repo "$REPO")
 
 echo "Fetching PR #$PR ..."
-META="$(gh pr view "$PR" ${GH_REPO[@]+"${GH_REPO[@]}"} --json number,title,body,headRefName,baseRefName,url)" \
+META="$(gh pr view "$PR" ${GH_REPO[@]+"${GH_REPO[@]}"} --json number,title,body,headRefName,baseRefName,headRefOid,url)" \
   || die "could not read PR #$PR (check the number, --repo, and 'gh auth status')"
 
 meta_get() { node -e 'const value=JSON.parse(process.argv[1])[process.argv[2]]; if (value) process.stdout.write(value)' "$META" "$1"; }
 TITLE="$(meta_get title)"
 BODY="$(meta_get body)"
 HEAD="$(meta_get headRefName)"
+HEAD_SHA="$(meta_get headRefOid)"
 BASE="$(meta_get baseRefName)"
 URL="$(meta_get url)"
 [ -n "$REPO" ] || REPO="$(printf '%s' "$URL" | sed -E 's#https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#')"
@@ -144,49 +145,27 @@ echo "Review:     $OUT/review.md"
 if [ "$POST" -eq 1 ]; then
   [ -s "$OUT/review-payload.json" ] || die "review-payload.json is missing; cannot post"
 
-  INLINE_COUNT="$(node --input-type=module -e 'import { readFileSync } from "node:fs"; console.log(JSON.parse(readFileSync(process.argv[1], "utf8")).comments.length)' "$OUT/review-payload.json")"
-  # Always post the gated payload (never the ungated review.md dump). Prefer a
-  # PR review; if create-review fails, post the payload body (+ inline text).
-  # Post first so inline comment ids exist, then attach report-back commands to
-  # fix-brief.md, upload the gist, and finally patch the review with the download link.
-  echo "Posting gated PR review ($INLINE_COUNT inline comment(s))..."
-  REVIEW_ID=""
-  echo "[]" > "$OUT/posted-comments.json"
-  if REVIEW_JSON="$(gh api --method POST "repos/$REPO/pulls/$PR/reviews" --input "$OUT/review-payload.json")"; then
-    REVIEW_ID="$(printf '%s' "$REVIEW_JSON" | node --input-type=module -e 'import { readFileSync } from "node:fs"; console.log(JSON.parse(readFileSync(0,"utf8")).id || "")')"
-    echo "Posted PR review${REVIEW_ID:+ (id $REVIEW_ID)}."
-    if [ -n "$REVIEW_ID" ]; then
-      if RAW="$(gh api --paginate "repos/$REPO/pulls/$PR/reviews/$REVIEW_ID/comments")"; then
-        printf '%s' "$RAW" | node --input-type=module -e '
-          import { readFileSync, writeFileSync } from "node:fs";
-          const raw = readFileSync(0, "utf8").trim();
-          let rows = [];
-          try { rows = JSON.parse(raw || "[]"); } catch { rows = []; }
-          if (!Array.isArray(rows)) rows = [];
-          writeFileSync(process.argv[1], JSON.stringify(rows.map((c) => ({
-            id: c.id, body: c.body || "", path: c.path, line: c.line ?? null,
-          })), null, 2));
-        ' "$OUT/posted-comments.json"
-      fi
-    fi
-  else
-    echo "create-review failed; posting gated payload as an issue comment..."
-    node --input-type=module -e '
-      import { readFileSync, writeFileSync } from "node:fs";
-      const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-      const parts = [payload.body.trimEnd()];
-      for (const c of payload.comments || []) {
-        parts.push("", "---", "", `**\`${c.path}:${c.line}\`**`, "", c.body);
-      }
-      writeFileSync(process.argv[2], parts.join("\n") + "\n");
-    ' "$OUT/review-payload.json" "$OUT/comment.md"
-    gh pr comment "$PR" ${GH_REPO[@]+"${GH_REPO[@]}"} --body-file "$OUT/comment.md" >/dev/null
-  fi
+  # Same posting path as the GitHub Action: threads, file comments, one checklist.
+  # opened (not synchronize) so an explicit --post still publishes a review when
+  # every finding already has an open thread.
+  echo "Posting the review..."
+  REPO="$REPO" PR_NUMBER="$PR" PR_ACTION=opened HEAD_SHA="${HEAD_SHA:-}" \
+    bash "$ROOT/scripts/post-review.sh" "$OUT" "$ROOT"
+  set -a
+  # shellcheck disable=SC1091
+  source "$OUT/post-result.env"
+  set +a
+  REVIEW_ID="${review_id:-}"
 
   if [ -f "$OUT/fix-brief.md" ] && [ -f "$OUT/fix-brief-targets.json" ]; then
+    CHECKLIST_ARGS=()
+    if [ -f "$OUT/checklist-comment.json" ]; then
+      CHECKLIST_ARGS=(--checklist "$OUT/checklist-comment.json")
+    fi
     node --experimental-strip-types "$ROOT/src/attach-replies.ts" \
       --brief "$OUT/fix-brief.md" --targets "$OUT/fix-brief-targets.json" \
-      --comments "$OUT/posted-comments.json"
+      --comments "$OUT/posted-comments.json" \
+      ${CHECKLIST_ARGS[@]+"${CHECKLIST_ARGS[@]}"}
   fi
 
   # Secret gists are unlisted but reachable by anyone with the URL (same as artifact links).
@@ -204,18 +183,56 @@ if [ "$POST" -eq 1 ]; then
     [ -n "$BRIEF_URL" ] || die "gh gist create did not print a gist URL (got: $GIST_OUT)"
     printf '%s\n' "$BRIEF_URL" > "$OUT/fix-brief-url.txt"
     echo "Fix brief gist: $BRIEF_URL"
-    if [ -n "$REVIEW_ID" ]; then
-      PATCH="$OUT/review-body-patch.json"
-      node --experimental-strip-types --input-type=module -e '
+  fi
+  if [ -n "$REVIEW_ID" ]; then
+    PAYLOAD="$OUT/deduped-payload.json"
+    [ -f "$PAYLOAD" ] || PAYLOAD="$OUT/review-payload.json"
+    CHECKLIST_URL=""
+    if [ -f "$OUT/checklist-comment.json" ]; then
+      CHECKLIST_ID="$(node -e 'const row=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(row.id?String(row.id):"")' "$OUT/checklist-comment.json")"
+      if [ -n "$CHECKLIST_ID" ]; then
+        CHECKLIST_URL="https://github.com/${REPO}/pull/${PR}#issuecomment-${CHECKLIST_ID}"
+      fi
+    fi
+    SUBMIT="$OUT/review-submit.json"
+    node --experimental-strip-types --input-type=module -e '
+      import { readFileSync, writeFileSync } from "node:fs";
+      import { pathToFileURL } from "node:url";
+      const { appendBriefDownloadLink, appendChecklistLink } = await import(pathToFileURL(process.argv[4]).href);
+      const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
+      let body = payload.body;
+      const checklistUrl = process.argv[5];
+      const briefUrl = process.argv[2];
+      if (checklistUrl) body = appendChecklistLink(body, checklistUrl);
+      if (briefUrl) body = appendBriefDownloadLink(body, briefUrl);
+      writeFileSync(process.argv[3], JSON.stringify({ body, event: "COMMENT" }));
+    ' "$PAYLOAD" "${BRIEF_URL:-}" "$SUBMIT" "$ROOT/src/attach-replies.ts" "${CHECKLIST_URL:-}"
+    gh api --method POST "repos/$REPO/pulls/$PR/reviews/$REVIEW_ID/events" --input "$SUBMIT" >/dev/null \
+      || echo "warning: could not submit the pending review"
+  elif [ -f "$OUT/comment.md" ]; then
+    node --experimental-strip-types --input-type=module -e '
+      import { readFileSync, writeFileSync } from "node:fs";
+      import { pathToFileURL } from "node:url";
+      const { appendBriefDownloadLink } = await import(pathToFileURL(process.argv[3]).href);
+      let body = readFileSync(process.argv[1], "utf8");
+      const briefUrl = process.argv[2];
+      if (briefUrl) body = appendBriefDownloadLink(body, briefUrl);
+      writeFileSync(process.argv[1], body.endsWith("\n") ? body : body + "\n");
+    ' "$OUT/comment.md" "${BRIEF_URL:-}" "$ROOT/src/attach-replies.ts"
+    CHECKLIST_ID=""
+    if [ -f "$OUT/checklist-comment.json" ]; then
+      CHECKLIST_ID="$(node -e 'const row=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(row.id?String(row.id):"")' "$OUT/checklist-comment.json")"
+    fi
+    if [ -n "$CHECKLIST_ID" ]; then
+      node --input-type=module -e '
         import { readFileSync, writeFileSync } from "node:fs";
-        import { pathToFileURL } from "node:url";
-        const { appendBriefDownloadLink } = await import(pathToFileURL(process.argv[4]).href);
-        const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-        const body = appendBriefDownloadLink(payload.body, process.argv[2]);
-        writeFileSync(process.argv[3], JSON.stringify({ body }));
-      ' "$OUT/review-payload.json" "$BRIEF_URL" "$PATCH" "$ROOT/src/attach-replies.ts"
-      gh api --method PUT "repos/$REPO/pulls/$PR/reviews/$REVIEW_ID" --input "$PATCH" >/dev/null \
-        || echo "warning: could not patch review body with fix-brief link"
+        writeFileSync(process.argv[2], JSON.stringify({ body: readFileSync(process.argv[1], "utf8") }));
+      ' "$OUT/comment.md" "$OUT/issue-comment.json"
+      gh api --method PATCH "repos/$REPO/issues/comments/$CHECKLIST_ID" --input "$OUT/issue-comment.json" >/dev/null \
+        || echo "warning: could not add the fix-brief link to the fallback comment"
+    else
+      gh pr comment "$PR" --repo "$REPO" --body-file "$OUT/comment.md" \
+        || echo "warning: could not post the fallback comment"
     fi
   fi
   echo "Posted the review to $URL"

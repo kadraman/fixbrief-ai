@@ -50,7 +50,7 @@ inputs:
     required: false
     default: "3"
   minimum-confidence:
-    description: Confidence floor for inline comments (0..1). Only severity critical or high at or above this floor post inline. Fix-brief medium findings are summarised in the overview; weaker findings stay in the job summary.
+    description: Confidence floor for critical and high findings (0..1). Medium findings at or above the fix-brief floor are also posted as review threads. Low, info, and weaker findings stay in the job summary.
     required: false
     default: "0.85"
   categories:
@@ -58,7 +58,7 @@ inputs:
     required: false
     default: "all"
   max-inline-comments:
-    description: Optional cap on inline review comments; 0 means no cap.
+    description: Optional cap on review threads (line and file comments together); 0 means no cap. Overflow is listed in the overview and in one checklist comment.
     required: false
     default: "0"
   fix-brief:
@@ -219,126 +219,21 @@ runs:
       run: |
         set -euo pipefail
         OUT="$RUNNER_TEMP/fixbrief-ai"
-        POSTED=false
-        PENDING=false
-        FALLBACK=false
-        REVIEW_ID=""
-        echo "[]" > "$OUT/posted-comments.json"
-        # A fix brief's download URL does not exist until the artifact is uploaded.
-        # Hold the review pending so its public body can include that URL at submit
-        # time. GitHub's conversation page does not show a body patched in later.
-        # Omit event: create-review accepts APPROVE, REQUEST_CHANGES, and COMMENT.
-        # Sending event "PENDING" is HTTP 422, and the submit step that adds the
-        # download link never runs.
-        REVIEW_INPUT="$REVIEW_PAYLOAD"
-        if [ "${HAS_BRIEF:-}" = "true" ]; then
-          REVIEW_INPUT="$OUT/review-pending.json"
-          node --experimental-strip-types --input-type=module -e '
-            import { readFileSync, writeFileSync } from "node:fs";
-            import { pathToFileURL } from "node:url";
-            const { toPendingReviewPayload } = await import(pathToFileURL(process.argv[3]).href);
-            const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-            writeFileSync(process.argv[2], JSON.stringify(toPendingReviewPayload(payload)));
-          ' "$REVIEW_PAYLOAD" "$REVIEW_INPUT" "$ACTION_PATH/src/attach-replies.ts"
-        fi
-        save_comments() {
-          local id="$1"
-          if [ -z "$id" ]; then echo "[]" > "$OUT/posted-comments.json"; return; fi
-          if RAW="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews/$id/comments")"; then
-            printf '%s' "$RAW" | node --input-type=module -e '
-              import { readFileSync, writeFileSync } from "node:fs";
-              const raw = readFileSync(0, "utf8").trim();
-              let rows = [];
-              try { rows = JSON.parse(raw || "[]"); } catch { rows = []; }
-              if (!Array.isArray(rows)) rows = [];
-              writeFileSync(process.argv[1], JSON.stringify(rows.map((c) => ({
-                id: c.id, body: c.body || "", path: c.path, line: c.line ?? null,
-              })), null, 2));
-            ' "$OUT/posted-comments.json"
-          else
-            echo "[]" > "$OUT/posted-comments.json"
-          fi
-        }
-        create_review() {
-          local err="$OUT/create-review.err"
-          if REVIEW_JSON="$(gh api --method POST "repos/$REPO/pulls/$PR_NUMBER/reviews" --input "$REVIEW_INPUT" 2>"$err")"; then
-            REVIEW_ID="$(printf '%s' "$REVIEW_JSON" | node --input-type=module -e 'import { readFileSync } from "node:fs"; console.log(JSON.parse(readFileSync(0,"utf8")).id || "")')"
-            return 0
-          fi
-          local detail
-          detail="$(printf '%s' "$REVIEW_JSON" | tr '\n' ' ')"
-          if [ -z "$detail" ] && [ -s "$err" ]; then detail="$(tr '\n' ' ' < "$err")"; fi
-          echo "::warning::create-review failed: ${detail}"
-          return 1
-        }
-        # When a fix brief exists, wait until the artifact URL is known before
-        # posting an issue comment, so that comment can include the download link.
-        on_create_failure() {
-          local posted_message="$1"
-          if [ "${HAS_BRIEF:-}" = "true" ]; then
-            FALLBACK=true
-            echo "Create-review failed. The overview will be posted after the fix brief is uploaded so the download link is included."
-            return 0
-          fi
-          node --experimental-strip-types --input-type=module -e '
-            import { readFileSync, writeFileSync } from "node:fs";
-            import { pathToFileURL } from "node:url";
-            const { overviewIssueComment } = await import(pathToFileURL(process.argv[3]).href);
-            const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-            writeFileSync(process.argv[2], overviewIssueComment(payload));
-          ' "$REVIEW_PAYLOAD" "$OUT/comment.md" "$ACTION_PATH/src/attach-replies.ts"
-          gh pr comment "$PR_NUMBER" --body-file "$OUT/comment.md"
-          echo "$posted_message"
-        }
-        # Decide whether the gated payload has anything worth posting.
-        HAS_CONTENT="$(node --input-type=module -e '
-          import { readFileSync } from "node:fs";
-          const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-          const has = payload.comments.length > 0
-            || /### Could not place inline|### Over the inline cap|### Also in the fix brief/.test(payload.body || "");
-          console.log(has ? "yes" : "no");
-        ' "$REVIEW_PAYLOAD")"
-        INLINE_COUNT="$(node --input-type=module -e '
-          import { readFileSync } from "node:fs";
-          console.log(JSON.parse(readFileSync(process.argv[1], "utf8")).comments.length);
-        ' "$REVIEW_PAYLOAD")"
-        if [ "$HAS_CONTENT" != "yes" ]; then
-          if [ "${PR_ACTION:-}" = "synchronize" ]; then
-            echo "Nothing met the publish gate on this push; leaving the earlier review in place."
-          else
-            # opened / reopened: post the gated overview so the first run is visible.
-            if create_review; then
-              POSTED=true
-              if [ "${HAS_BRIEF:-}" = "true" ]; then
-                echo "Created a pending empty-gate review; it will be submitted with the fix-brief link."
-              else
-                echo "Posted empty-gate PR review (no inline findings)."
-              fi
-              save_comments "$REVIEW_ID"
-            else
-              on_create_failure "Posted empty-gate summary comment."
-            fi
-          fi
-        else
-          # Prefer a single PR review (overview + inline threads). Fall back to an
-          # issue comment (never review.md) if create-review fails.
-          if create_review; then
-            POSTED=true
-            if [ "${HAS_BRIEF:-}" = "true" ]; then
-              echo "Created a pending review with $INLINE_COUNT inline comment(s); it will be submitted with the fix-brief link."
-            else
-              echo "Posted PR review with $INLINE_COUNT inline comment(s)."
-            fi
-            save_comments "$REVIEW_ID"
-          else
-            on_create_failure "Posted gated summary comment with $INLINE_COUNT finding(s)."
-          fi
-        fi
-        if [ "${HAS_BRIEF:-}" = "true" ] && [ -n "$REVIEW_ID" ]; then PENDING=true; fi
-        echo "posted=$POSTED" >> "$GITHUB_OUTPUT"
-        echo "pending=$PENDING" >> "$GITHUB_OUTPUT"
-        echo "fallback=$FALLBACK" >> "$GITHUB_OUTPUT"
-        echo "review_id=$REVIEW_ID" >> "$GITHUB_OUTPUT"
+        # Hold the review pending by omitting event (the string PENDING is HTTP 422).
+        # GitHub's conversation page keeps the body from submit time and does not
+        # show a link added by editing the review later. A failed create-review
+        # sets fallback so the overview is posted after the fix-brief link exists.
+        HEAD_SHA="${{ github.event.pull_request.head.sha }}" \
+          PR_ACTION="$PR_ACTION" \
+          bash "$ACTION_PATH/scripts/post-review.sh" "$OUT" "$ACTION_PATH"
+        set -a
+        # shellcheck disable=SC1091
+        source "$OUT/post-result.env"
+        set +a
+        echo "posted=$posted" >> "$GITHUB_OUTPUT"
+        echo "pending=$pending" >> "$GITHUB_OUTPUT"
+        echo "fallback=${fallback:-false}" >> "$GITHUB_OUTPUT"
+        echo "review_id=$review_id" >> "$GITHUB_OUTPUT"
 
     - name: Attach fix-brief report-back
       if: steps.review.outputs.has_brief == 'true'
@@ -356,8 +251,13 @@ runs:
           echo "No fix-brief-targets.json; skipping report-back attach."
           exit 0
         fi
+        CHECKLIST_ARGS=()
+        if [ -f "$OUT/checklist-comment.json" ]; then
+          CHECKLIST_ARGS=(--checklist "$OUT/checklist-comment.json")
+        fi
         node --experimental-strip-types "$ACTION_PATH/src/attach-replies.ts" \
-          --brief "$BRIEF_PATH" --targets "$TARGETS" --comments "$COMMENTS"
+          --brief "$BRIEF_PATH" --targets "$TARGETS" --comments "$COMMENTS" \
+          ${CHECKLIST_ARGS[@]+"${CHECKLIST_ARGS[@]}"}
 
     - name: Upload fix brief
       id: upload
@@ -386,16 +286,16 @@ runs:
         OUT="$RUNNER_TEMP/fixbrief-ai"
         SUBMIT="$OUT/review-submit.json"
         COMMENT="$OUT/comment.md"
-        node --experimental-strip-types --input-type=module -e '
-          import { readFileSync, writeFileSync } from "node:fs";
-          import { pathToFileURL } from "node:url";
-          const { appendBriefDownloadLink, overviewIssueComment } = await import(pathToFileURL(process.argv[5]).href);
-          const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-          const url = process.argv[2];
-          const body = url ? appendBriefDownloadLink(payload.body, url) : payload.body;
-          writeFileSync(process.argv[3], JSON.stringify({ body, event: "COMMENT" }));
-          writeFileSync(process.argv[4], overviewIssueComment(payload, url));
-        ' "$REVIEW_PAYLOAD" "${BRIEF_URL:-}" "$SUBMIT" "$COMMENT" "$ACTION_PATH/src/attach-replies.ts"
+        PAYLOAD="$OUT/deduped-payload.json"
+        if [ ! -f "$PAYLOAD" ]; then PAYLOAD="$REVIEW_PAYLOAD"; fi
+        CHECKLIST_URL=""
+        CHECKLIST_ID=""
+        if [ -f "$OUT/checklist-comment.json" ]; then
+          CHECKLIST_ID="$(node -e 'const row=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(row.id?String(row.id):"")' "$OUT/checklist-comment.json")"
+          if [ -n "$CHECKLIST_ID" ]; then
+            CHECKLIST_URL="https://github.com/${REPO}/pull/${PR_NUMBER}#issuecomment-${CHECKLIST_ID}"
+          fi
+        fi
         link_note() {
           if [ -n "${BRIEF_URL:-}" ]; then
             echo "$1 with the fix-brief link."
@@ -403,11 +303,55 @@ runs:
             echo "::warning::$1 without a fix-brief link (artifact URL missing)."
           fi
         }
+        # Create-review failed and the overview is already one issue comment. Add the
+        # download link with a PATCH so the report-back brief can keep that comment id.
         if [ -z "${REVIEW_ID:-}" ]; then
-          gh pr comment "$PR_NUMBER" --body-file "$COMMENT"
-          link_note "Posted overview comment"
+          if [ ! -f "$COMMENT" ]; then
+            echo "::warning::Create-review failed and no fallback body was written."
+            exit 1
+          fi
+          node --experimental-strip-types --input-type=module -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+            import { pathToFileURL } from "node:url";
+            const { appendBriefDownloadLink } = await import(pathToFileURL(process.argv[3]).href);
+            let body = readFileSync(process.argv[1], "utf8");
+            const briefUrl = process.argv[2];
+            if (briefUrl) body = appendBriefDownloadLink(body, briefUrl);
+            writeFileSync(process.argv[1], body.endsWith("\n") ? body : body + "\n");
+          ' "$COMMENT" "${BRIEF_URL:-}" "$ACTION_PATH/src/attach-replies.ts"
+          if [ -n "$CHECKLIST_ID" ]; then
+            node --input-type=module -e '
+              import { readFileSync, writeFileSync } from "node:fs";
+              writeFileSync(process.argv[2], JSON.stringify({ body: readFileSync(process.argv[1], "utf8") }));
+            ' "$COMMENT" "$OUT/issue-comment.json"
+            gh api --method PATCH "repos/$REPO/issues/comments/$CHECKLIST_ID" --input "$OUT/issue-comment.json" >/dev/null
+            link_note "Updated overview comment"
+          else
+            gh pr comment "$PR_NUMBER" --body-file "$COMMENT"
+            link_note "Posted overview comment"
+          fi
           exit 0
         fi
+        node --experimental-strip-types --input-type=module -e '
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { pathToFileURL } from "node:url";
+          const { appendBriefDownloadLink, appendChecklistLink } = await import(pathToFileURL(process.argv[5]).href);
+          const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
+          const briefUrl = process.argv[2];
+          const checklistUrl = process.argv[6];
+          let body = payload.body;
+          if (checklistUrl) body = appendChecklistLink(body, checklistUrl);
+          if (briefUrl) body = appendBriefDownloadLink(body, briefUrl);
+          writeFileSync(process.argv[3], JSON.stringify({ body, event: "COMMENT" }));
+          const parts = [body.trimEnd()];
+          for (const comment of payload.comments || []) {
+            parts.push("", "---", "", `**\`${comment.path}:${comment.line ?? ""}\`**`, "", comment.body);
+          }
+          for (const comment of payload.fileComments || []) {
+            parts.push("", "---", "", `**\`${comment.path}\`**`, "", comment.body);
+          }
+          writeFileSync(process.argv[4], parts.join("\n") + "\n");
+        ' "$PAYLOAD" "${BRIEF_URL:-}" "$SUBMIT" "$COMMENT" "$ACTION_PATH/src/attach-replies.ts" "${CHECKLIST_URL}"
         if gh api --method POST "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/events" --input "$SUBMIT" >"$OUT/submit.out" 2>"$OUT/submit.err"; then
           link_note "Submitted review $REVIEW_ID"
         else

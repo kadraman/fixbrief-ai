@@ -63,14 +63,26 @@ export function annotateDiff(fileDiff: string): string {
   }).join("\n");
 }
 
-/** Split findings into those GitHub can attach inline and those that must stay in the summary. */
-export function anchorFindings(findings: Finding[], map: LineMap): { anchored: Finding[]; unanchored: Finding[] } {
-  const anchored: Finding[] = [], unanchored: Finding[] = [];
+/**
+ * Split findings by how GitHub can host a review thread.
+ * `anchored` lines are on the pull request diff. `fileLevel` files are in the diff
+ * but the line is not commentable, so a file comment can still be posted.
+ * `unanchored` files are not in the diff at all.
+ */
+export function anchorFindings(
+  findings: Finding[], map: LineMap,
+): { anchored: Finding[]; fileLevel: Finding[]; unanchored: Finding[] } {
+  const anchored: Finding[] = [], fileLevel: Finding[] = [], unanchored: Finding[] = [];
   for (const finding of findings) {
     const path = resolvePath(map, finding.file);
     const lines = path ? map.get(path) : undefined;
     const commentable = (n: number) => !!lines && (lines.added.has(n) || lines.context.has(n));
-    if (!path || !lines || !commentable(finding.line)) { unanchored.push(finding); continue; }
+    if (!path || !lines) { unanchored.push(finding); continue; }
+    if (!commentable(finding.line)) {
+      // A suggestion fence is only valid on a diff line.
+      fileLevel.push({ ...finding, file: path, endLine: undefined, suggestion: undefined });
+      continue;
+    }
     let { endLine, suggestion } = finding;
     if (endLine !== undefined) {
       const maxKnown = Math.max(0, ...lines.added, ...lines.context);
@@ -81,5 +93,5 @@ export function anchorFindings(findings: Finding[], map: LineMap): { anchored: F
     }
     anchored.push({ ...finding, file: path, endLine, suggestion });
   }
-  return { anchored, unanchored };
+  return { anchored, fileLevel, unanchored };
 }
