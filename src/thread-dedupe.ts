@@ -14,6 +14,8 @@ export interface ExistingThread {
   author?: string;
   path?: string;
   line?: number | null;
+  /** Line the comment was first left on. Used when `line` is null because the diff moved. */
+  originalLine?: number;
 }
 
 export interface ExistingChecklist {
@@ -78,6 +80,13 @@ function hasLine(line: number | null | undefined): line is number {
   return typeof line === "number";
 }
 
+/** Current anchor, or the original line when GitHub has cleared the current one. */
+function threadLocation(thread: ExistingThread): number | undefined {
+  if (typeof thread.line === "number") return thread.line;
+  if (typeof thread.originalLine === "number") return thread.originalLine;
+  return undefined;
+}
+
 interface ThreadClaim {
   id: string;
   fingerprint: string;
@@ -89,12 +98,30 @@ interface ThreadClaim {
   body: string;
 }
 
+function lineAgrees(thread: ExistingThread, claim: ThreadClaim): boolean {
+  const location = threadLocation(thread);
+  if (location === undefined || !hasLine(claim.line)) return true;
+  return location === claim.line;
+}
+
+/**
+ * True when several same-title findings have to be assigned together.
+ * An exact fingerprint is stale once those lines have shifted, so the group
+ * is reconciled from current locations before any fingerprint is trusted.
+ */
+function reconcilesAsGroup(claims: ThreadClaim[], threads: ExistingThread[], base: string, bases: Set<string>): boolean {
+  const lineClaims = claims.filter((claim) => claim.base === base && hasLine(claim.line));
+  const located = threads.filter((thread) => threadBaseOf(thread, bases) === base && threadLocation(thread) !== undefined);
+  return lineClaims.length >= 2 && located.length >= 2;
+}
+
 /**
  * Match findings to unresolved trusted threads.
- * The same fingerprint wins first. A line shift still matches the thread at
- * GitHub's current line for that file and title, and same-title findings are
- * paired to different threads. A legacy file comment, which has no line, matches
- * a new file comment on that path.
+ * Several same-title findings are paired from their current lines before any
+ * fingerprint is trusted. A fingerprint is otherwise used only when it still
+ * agrees with the thread's current line. One finding that lost its line, or
+ * moved between a line comment and a file comment, reuses the single open
+ * thread for that file and title.
  */
 function assignOpenThreads(
   claims: ThreadClaim[],
@@ -105,23 +132,48 @@ function assignOpenThreads(
   const trusted = threads.filter((thread) => !thread.resolved && isTrustedThread(thread, actor) && parseFingerprintMarker(thread.body));
   const used = new Set<number>();
   const assigned = new Map<string, ExistingThread>();
+  const take = (claim: ThreadClaim, thread: ExistingThread) => {
+    used.add(thread.commentId);
+    assigned.set(claim.id, thread);
+  };
+  const grouped = new Set(claims.filter((claim) => reconcilesAsGroup(claims, trusted, claim.base, bases)).map((claim) => claim.base));
   for (const claim of claims) {
-    const exact = newest(trusted.filter((thread) => !used.has(thread.commentId) && parseFingerprintMarker(thread.body) === claim.fingerprint));
+    if (hasLine(claim.line) && grouped.has(claim.base)) continue;
+    const exact = newest(trusted.filter((thread) => !used.has(thread.commentId) && parseFingerprintMarker(thread.body) === claim.fingerprint && lineAgrees(thread, claim)));
     if (!exact) continue;
-    used.add(exact.commentId);
-    assigned.set(claim.id, exact);
+    take(claim, exact);
   }
   const lineClaims = claims.filter((claim) => !assigned.has(claim.id) && hasLine(claim.line));
-  const lineThreads = trusted.filter((thread) => !used.has(thread.commentId) && hasLine(thread.line) && threadBaseOf(thread, bases));
+  const lineThreads = trusted.filter((thread) => !used.has(thread.commentId) && threadLocation(thread) !== undefined && threadBaseOf(thread, bases));
   const pairs = matchByLocation(
     lineClaims.map((claim) => ({ id: claim.id, base: claim.base, line: claim.line })),
-    lineThreads.map((thread) => ({ id: String(thread.commentId), base: threadBaseOf(thread, bases)!, line: thread.line ?? undefined })),
+    lineThreads.map((thread) => ({ id: String(thread.commentId), base: threadBaseOf(thread, bases)!, line: threadLocation(thread) })),
   );
   for (const claim of lineClaims) {
     const thread = lineThreads.find((item) => String(item.commentId) === pairs.get(claim.id)?.id);
     if (!thread) continue;
-    used.add(thread.commentId);
-    assigned.set(claim.id, thread);
+    take(claim, thread);
+  }
+  const openClaims = claims.filter((claim) => !assigned.has(claim.id));
+  const openThreads = trusted.filter((thread) => !used.has(thread.commentId) && thread.path && threadBaseOf(thread, bases));
+  const byBase = new Map<string, { claims: ThreadClaim[]; threads: ExistingThread[] }>();
+  for (const claim of openClaims) {
+    const group = byBase.get(claim.base) ?? { claims: [], threads: [] };
+    group.claims.push(claim);
+    byBase.set(claim.base, group);
+  }
+  for (const thread of openThreads) {
+    const base = threadBaseOf(thread, bases);
+    const group = base ? byBase.get(base) : undefined;
+    if (group) group.threads.push(thread);
+  }
+  for (const group of byBase.values()) {
+    if (group.claims.length !== 1 || group.threads.length !== 1) continue;
+    const claim = group.claims[0];
+    const thread = group.threads[0];
+    if (!thread.path || threadKeyPath(thread.path) !== threadKeyPath(claim.path)) continue;
+    if (hasLine(claim.line) && threadLocation(thread) !== undefined) continue;
+    take(claim, thread);
   }
   const fileThreads = new Map<string, ExistingThread[]>();
   for (const thread of trusted) {
@@ -140,8 +192,7 @@ function assignOpenThreads(
     const index = list.findIndex((thread) => thread.path && threadKeyPath(thread.path) === threadKeyPath(claim.path));
     if (index < 0) continue;
     const [thread] = list.splice(index, 1);
-    used.add(thread.commentId);
-    assigned.set(claim.id, thread);
+    take(claim, thread);
   }
   return assigned;
 }

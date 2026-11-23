@@ -963,9 +963,111 @@ export interface LocationRef {
 }
 
 /**
- * Pair items that share a file and title. Each side is used once.
- * The closest lines are paired first, so an insertion above several findings
- * keeps each one with its own existing entry.
+ * A single finding is reused only when it stays in this neighborhood.
+ * A wider gap is a different finding unless several same-title findings move
+ * by the same amount, which is evidence that one edit shifted them together.
+ */
+export const LONE_LINE_SHIFT = 15;
+
+interface ShiftMatch<T, U> {
+  pairs: Array<[T, U]>;
+  cost: number;
+}
+
+function byLine<T extends LocationRef>(items: T[]): T[] {
+  return items
+    .filter((item) => item.line !== undefined)
+    .sort((a, b) => (a.line as number) - (b.line as number) || a.id.localeCompare(b.id));
+}
+
+/** Same-title findings that all moved by one offset. One pair is not evidence. */
+function uniformShift<T extends LocationRef, U extends LocationRef>(left: T[], right: U[]): ShiftMatch<T, U> | null {
+  let best: ShiftMatch<T, U> | null = null;
+  const deltas = new Set<number>();
+  for (const claim of left) {
+    for (const prior of right) deltas.add((claim.line as number) - (prior.line as number));
+  }
+  for (const delta of deltas) {
+    const pairs: Array<[T, U]> = [];
+    let j = 0;
+    for (const claim of left) {
+      const target = (claim.line as number) - delta;
+      while (j < right.length && (right[j].line as number) < target) j++;
+      if (j < right.length && right[j].line === target) {
+        pairs.push([claim, right[j]]);
+        j++;
+      }
+    }
+    if (pairs.length < 2) continue;
+    const cost = pairs.length * Math.abs(delta);
+    if (!best || pairs.length > best.pairs.length || (pairs.length === best.pairs.length && cost < best.cost)) {
+      best = { pairs, cost };
+    }
+  }
+  return best;
+}
+
+/**
+ * Non-crossing pairs inside {@link LONE_LINE_SHIFT}. More pairs win over a
+ * shorter jump, so a finding that lands on a neighbor's old line does not take it.
+ */
+function localShift<T extends LocationRef, U extends LocationRef>(left: T[], right: U[]): ShiftMatch<T, U> {
+  const n = left.length;
+  const m = right.length;
+  const count: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  const cost: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  const choice: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      let bestCount = count[i - 1][j];
+      let bestCost = cost[i - 1][j];
+      let how = 0;
+      if (count[i][j - 1] > bestCount || (count[i][j - 1] === bestCount && cost[i][j - 1] < bestCost)) {
+        bestCount = count[i][j - 1];
+        bestCost = cost[i][j - 1];
+        how = 1;
+      }
+      const delta = Math.abs((left[i - 1].line as number) - (right[j - 1].line as number));
+      if (delta <= LONE_LINE_SHIFT) {
+        const pairCount = count[i - 1][j - 1] + 1;
+        const pairCost = cost[i - 1][j - 1] + delta;
+        if (pairCount > bestCount || (pairCount === bestCount && pairCost < bestCost)) {
+          bestCount = pairCount;
+          bestCost = pairCost;
+          how = 2;
+        }
+      }
+      count[i][j] = bestCount;
+      cost[i][j] = bestCost;
+      choice[i][j] = how;
+    }
+  }
+  const pairs: Array<[T, U]> = [];
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    if (choice[i][j] === 2) {
+      pairs.push([left[i - 1], right[j - 1]]);
+      i--;
+      j--;
+    } else if (choice[i][j] === 1) j--;
+    else i--;
+  }
+  pairs.reverse();
+  return { pairs, cost: cost[n][m] };
+}
+
+function chooseShift<T, U>(uniform: ShiftMatch<T, U> | null, local: ShiftMatch<T, U>): Array<[T, U]> {
+  if (uniform && (uniform.pairs.length > local.pairs.length || (uniform.pairs.length === local.pairs.length && uniform.cost < local.cost))) {
+    return uniform.pairs;
+  }
+  return local.pairs;
+}
+
+/**
+ * Pair items that share a file and title. Each side is used once, in line order.
+ * A lone far jump is left unmatched. Several findings that share one offset stay
+ * with their own entries, including when one of them lands on another's old line.
  */
 export function matchByLocation<T extends LocationRef, U extends LocationRef>(current: T[], existing: U[]): Map<string, U> {
   const result = new Map<string, U>();
@@ -980,22 +1082,11 @@ export function matchByLocation<T extends LocationRef, U extends LocationRef>(cu
     if (group) group.existing.push(item);
   }
   for (const group of groups.values()) {
-    const left = [...group.current];
-    const right = [...group.existing];
-    while (left.length && right.length) {
-      let bestI = -1, bestJ = -1, bestCost = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < left.length; i++) {
-        if (left[i].line === undefined) continue;
-        for (let j = 0; j < right.length; j++) {
-          if (right[j].line === undefined) continue;
-          const cost = Math.abs((left[i].line as number) - (right[j].line as number));
-          if (cost < bestCost) { bestCost = cost; bestI = i; bestJ = j; }
-        }
-      }
-      if (bestI < 0) break;
-      result.set(left[bestI].id, right[bestJ]);
-      left.splice(bestI, 1);
-      right.splice(bestJ, 1);
+    const left = byLine(group.current);
+    const right = byLine(group.existing);
+    if (!left.length || !right.length) continue;
+    for (const [claim, prior] of chooseShift(uniformShift(left, right), localShift(left, right))) {
+      result.set(claim.id, prior);
     }
   }
   return result;

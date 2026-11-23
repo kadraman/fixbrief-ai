@@ -6,7 +6,7 @@ import {
   parseCategories, parseFindingMarker, parseResponse, parseSkippedEntry, partitionInline,
   payloadHasContent, publishableFindings, qualifiesForFixBrief, qualifiesForInline,
   rankFindings, renderFinding, repairFindingsPrompt, reviewOverviewBody,
-  checklistItemFromFinding, mergeChecklistBody, mergeChecklistReport, renderChecklistBody, threadFingerprint,
+  checklistItemFromFinding, matchByLocation, mergeChecklistBody, mergeChecklistReport, renderChecklistBody, threadFingerprint,
 } from "../src/findings.ts";
 import { reviewSystemPrompt } from "../src/fixbrief-ai.ts";
 
@@ -494,6 +494,26 @@ test("mergeChecklistBody appends new items and keeps text the agent already wrot
   assert.equal(mergeChecklistBody(merged, [first, second]), `${merged.trimEnd()}\n`);
 });
 
+test("matchByLocation keeps order for a shared shift and leaves a far line unmatched", () => {
+  const far = matchByLocation(
+    [{ id: "new", base: "p", line: 500 }],
+    [{ id: "old", base: "p", line: 10 }],
+  );
+  assert.equal(far.size, 0);
+  const ordered = matchByLocation(
+    [{ id: "a", base: "p", line: 29 }, { id: "b", base: "p", line: 49 }],
+    [{ id: "t10", base: "p", line: 10 }, { id: "t30", base: "p", line: 30 }],
+  );
+  assert.equal(ordered.get("a")?.id, "t10");
+  assert.equal(ordered.get("b")?.id, "t30");
+  const crossed = matchByLocation(
+    [{ id: "a", base: "p", line: 12 }, { id: "b", base: "p", line: 14 }],
+    [{ id: "t10", base: "p", line: 10 }, { id: "t12", base: "p", line: 12 }],
+  );
+  assert.equal(crossed.get("a")?.id, "t10");
+  assert.equal(crossed.get("b")?.id, "t12");
+});
+
 test("a checklist item whose line moved reuses the existing entry", () => {
   const original = checklistItemFromFinding(sig({ id: "RB1", title: "Moved", file: "a.py", line: 10 }) as any);
   const existing = mergeChecklistBody(undefined, [original]).replace(
@@ -507,6 +527,19 @@ test("a checklist item whose line moved reuses the existing entry", () => {
   assert.equal(merged.split("fixbrief-ai-item:").length, 3);
   assert.match(merged, /#### high: Other/);
   assert.equal(mergeChecklistBody(merged, [shifted]), `${merged.trimEnd()}\n`);
+});
+
+test("a checklist item far from the existing one is appended", () => {
+  const original = checklistItemFromFinding(sig({ id: "RB1", title: "Moved", file: "a.py", line: 10 }) as any);
+  const existing = mergeChecklistBody(undefined, [original]).replace(
+    "<what you fixed, or why you skipped this finding>",
+    "Already reported.",
+  );
+  const distant = checklistItemFromFinding(sig({ id: "RB2", title: "Moved", file: "a.py", line: 500 }) as any);
+  const merged = mergeChecklistBody(existing, [distant]);
+  assert.match(merged, /Already reported\./);
+  assert.match(merged, /`a.py:500`/);
+  assert.equal(merged.split("fixbrief-ai-item:").length, 3);
 });
 
 test("mergeChecklistReport keeps the download link and later checklist edits", () => {

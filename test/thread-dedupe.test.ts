@@ -94,6 +94,102 @@ test("a finding whose line moved reuses its thread, and same-title findings stay
   assert.equal(result.reused.find((item) => item.findingId === "B")?.id, 30);
 });
 
+test("a same-title finding far from an open thread stays a new comment", () => {
+  const payload = githubReviewPayload([
+    sig({ id: "NEW", line: 500, title: "Shared", confidence: 0.99 }) as any,
+  ], 0.85);
+  const result = dedupeThreads(payload, [{
+    commentId: 10, resolved: false, author: "github-actions", path: "a.py", line: 10,
+    body: `**Shared**\n\n${fingerprintMarker(threadFingerprint({ file: "a.py", title: "Shared", line: 10 }))}`,
+  }], undefined, { actor: "github-actions" });
+  assert.equal(result.payload.comments.length, 1);
+  assert.equal(result.reused.length, 0);
+});
+
+test("same-title findings that shift past each other keep their own threads", () => {
+  const at = (line: number) => threadFingerprint({ file: "a.py", title: "Shared", line });
+  const moved = githubReviewPayload([
+    sig({ id: "A", line: 29, title: "Shared", confidence: 0.99 }) as any,
+    sig({ id: "B", line: 49, title: "Shared", confidence: 0.9 }) as any,
+  ], 0.85);
+  const result = dedupeThreads(moved, [
+    { commentId: 10, resolved: false, author: "github-actions", path: "a.py", line: 10, body: `**Shared**\n\n${fingerprintMarker(at(10))}` },
+    { commentId: 30, resolved: false, author: "github-actions", path: "a.py", line: 30, body: `**Shared**\n\n${fingerprintMarker(at(30))}` },
+  ], undefined, { actor: "github-actions" });
+  assert.equal(result.payload.comments.length, 0);
+  assert.equal(result.reused.find((item) => item.findingId === "A")?.id, 10);
+  assert.equal(result.reused.find((item) => item.findingId === "B")?.id, 30);
+});
+
+test("a stale fingerprint does not steal the thread of a neighboring finding", () => {
+  const at = (line: number) => threadFingerprint({ file: "a.py", title: "Shared", line });
+  const moved = githubReviewPayload([
+    sig({ id: "A", line: 12, title: "Shared", confidence: 0.99 }) as any,
+    sig({ id: "B", line: 14, title: "Shared", confidence: 0.9 }) as any,
+  ], 0.85);
+  const stale = dedupeThreads(moved, [
+    { commentId: 10, resolved: false, author: "github-actions", path: "a.py", line: 10, body: `**Shared**\n\n${fingerprintMarker(at(10))}` },
+    { commentId: 12, resolved: false, author: "github-actions", path: "a.py", line: 12, body: `**Shared**\n\n${fingerprintMarker(at(12))}` },
+  ], undefined, { actor: "github-actions" });
+  assert.equal(stale.reused.find((item) => item.findingId === "A")?.id, 10);
+  assert.equal(stale.reused.find((item) => item.findingId === "B")?.id, 12);
+  const tracked = dedupeThreads(moved, [
+    { commentId: 10, resolved: false, author: "github-actions", path: "a.py", line: 12, body: `**Shared**\n\n${fingerprintMarker(at(10))}` },
+    { commentId: 12, resolved: false, author: "github-actions", path: "a.py", line: 14, body: `**Shared**\n\n${fingerprintMarker(at(12))}` },
+  ], undefined, { actor: "github-actions" });
+  assert.equal(tracked.payload.comments.length, 0);
+  assert.equal(tracked.reused.find((item) => item.findingId === "A")?.id, 10);
+  assert.equal(tracked.reused.find((item) => item.findingId === "B")?.id, 12);
+});
+
+test("a shifted finding reuses its thread when the current line is null", () => {
+  const payload = githubReviewPayload([
+    sig({ id: "A", line: 12, title: "Shared" }) as any,
+  ], 0.85);
+  const known = dedupeThreads(payload, [{
+    commentId: 10, resolved: false, author: "github-actions", path: "a.py", line: null, originalLine: 10,
+    body: `**Shared**\n\n${fingerprintMarker(threadFingerprint({ file: "a.py", title: "Shared", line: 10 }))}`,
+  }], undefined, { actor: "github-actions" });
+  assert.equal(known.payload.comments.length, 0);
+  assert.equal(known.reused[0].id, 10);
+  const dropped = dedupeThreads(payload, [{
+    commentId: 11, resolved: false, author: "github-actions", path: "a.py", line: null,
+    body: `**Shared**\n\n${fingerprintMarker(threadFingerprint({ file: "a.py", title: "Shared", line: 10 }))}`,
+  }], undefined, { actor: "github-actions" });
+  assert.equal(dropped.payload.comments.length, 0);
+  assert.equal(dropped.reused[0].id, 11);
+  const far = githubReviewPayload([
+    sig({ id: "NEW", line: 500, title: "Shared", confidence: 0.99 }) as any,
+  ], 0.85);
+  const unrelated = dedupeThreads(far, [{
+    commentId: 10, resolved: false, author: "github-actions", path: "a.py", line: null, originalLine: 10,
+    body: `**Shared**\n\n${fingerprintMarker(threadFingerprint({ file: "a.py", title: "Shared", line: 10 }))}`,
+  }], undefined, { actor: "github-actions" });
+  assert.equal(unrelated.payload.comments.length, 1);
+  assert.equal(unrelated.reused.length, 0);
+});
+
+test("a finding moving between a line comment and a file comment reuses the one thread", () => {
+  const filePayload = githubReviewPayload([], 0.85, Number.POSITIVE_INFINITY, undefined, [], false, {}, 0.75, [
+    sig({ id: "A", title: "Off hunk", line: 80 }) as any,
+  ]);
+  const fromLine = dedupeThreads(filePayload, [{
+    commentId: 40, resolved: false, author: "github-actions", path: "a.py", line: 40,
+    body: `**Off hunk**\n\n${fingerprintMarker(threadFingerprint({ file: "a.py", title: "Off hunk", line: 40 }))}`,
+  }], undefined, { actor: "github-actions" });
+  assert.equal(fromLine.payload.fileComments.length, 0);
+  assert.equal(fromLine.reused[0].id, 40);
+  const linePayload = githubReviewPayload([
+    sig({ id: "A", line: 80, title: "Off hunk" }) as any,
+  ], 0.85);
+  const fromFile = dedupeThreads(linePayload, [{
+    commentId: 44, resolved: false, author: "github-actions", path: "a.py",
+    body: `**Off hunk**\n\n${fingerprintMarker(threadBaseFingerprint({ file: "a.py", title: "Off hunk" }))}`,
+  }], undefined, { actor: "github-actions" });
+  assert.equal(fromFile.payload.comments.length, 0);
+  assert.equal(fromFile.reused[0].id, 44);
+});
+
 test("a legacy file comment with no line is reused for the same path and title", () => {
   const payload = githubReviewPayload([], 0.85, Number.POSITIVE_INFINITY, undefined, [], false, {}, 0.75, [
     sig({ title: "Off hunk", line: 80 }) as any,
