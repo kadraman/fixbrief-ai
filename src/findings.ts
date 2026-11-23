@@ -54,11 +54,6 @@ export interface Finding {
   confidenceBreakdown?: ConfidenceBreakdown;
   /** Set when a disproof pass judged this finding. Absent when it was not checked. */
   refute?: RefuteNote;
-  /**
-   * Set for a later finding that shares a file and title with an earlier one.
-   * The first keeps a line-independent thread id so a later run can still find it.
-   */
-  occurrence?: number;
 }
 
 export interface GitHubReviewComment {
@@ -124,12 +119,15 @@ export function normalizeThreadTitle(title: string): string {
   return title.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-/**
- * Stable id for a finding across runs. The line is omitted so a small edit is the same thread.
- * A later finding with the same file and title includes its line so it is not discarded.
- */
-export function threadFingerprint(finding: { file: string; title: string; line?: number; occurrence?: number }): string {
-  const line = finding.occurrence && finding.occurrence > 1 && finding.line !== undefined ? `\0${finding.line}` : "";
+/** File and title only. Older reviews used this for the first finding that shared a title. */
+export function threadBaseFingerprint(finding: { file: string; title: string }): string {
+  const key = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}`;
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+/** Stable id for one finding. The line is included, so rank and sibling findings do not change it. */
+export function threadFingerprint(finding: { file: string; title: string; line?: number }): string {
+  const line = finding.line !== undefined ? `\0${finding.line}` : "";
   const key = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}${line}`;
   return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
@@ -819,23 +817,24 @@ export function publishableFindings(
 ): { inline: Finding[]; fileLevel: Finding[]; unanchored: Finding[]; capped: Finding[]; all: Finding[] } {
   const qualify = (finding: Finding) =>
     qualifiesForFixBrief(finding, minimumConfidence, fixBriefMediumConfidence, requireMultiRun);
-  const fileIds = new Set(fileLevel.map((finding) => finding.id));
-  const threadable = distinctThreadFindings(rankFindings([...anchored, ...fileLevel].filter(qualify)));
+  const fileSet = new Set(fileLevel);
+  const unanchoredSet = new Set(unanchored);
+  const qualified = distinctThreadFindings(rankFindings(
+    [...anchored, ...fileLevel, ...unanchored].filter(qualify),
+  ));
+  const threadable = qualified.filter((finding) => !unanchoredSet.has(finding));
   const threads = maxComments > 0 ? threadable.slice(0, maxComments) : threadable;
   const capped = maxComments > 0 ? threadable.slice(maxComments) : [];
-  const gatedUnanchored = distinctThreadFindings(rankFindings(unanchored.filter(qualify)));
-  const inline = threads.filter((finding) => !fileIds.has(finding.id));
-  const files = threads.filter((finding) => fileIds.has(finding.id));
+  const gatedUnanchored = qualified.filter((finding) => unanchoredSet.has(finding));
+  const inline = threads.filter((finding) => !fileSet.has(finding));
+  const files = threads.filter((finding) => fileSet.has(finding));
   return {
     inline, fileLevel: files, unanchored: gatedUnanchored, capped,
     all: [...threads, ...gatedUnanchored, ...capped],
   };
 }
 
-/**
- * Keep every ranked finding that has its own line. The same file, title, and line
- * stays one finding (the higher-ranked copy). A second line keeps its own thread id.
- */
+/** Keep the higher-ranked finding when the same file, title, and line appear twice. */
 export function distinctThreadFindings(findings: Finding[]): Finding[] {
   const seenAt = new Set<string>();
   const kept: Finding[] = [];
@@ -845,17 +844,7 @@ export function distinctThreadFindings(findings: Finding[]): Finding[] {
     seenAt.add(at);
     kept.push(finding);
   }
-  const seenTitle = new Map<string, number>();
-  return kept.map((finding) => {
-    const title = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}`;
-    const count = (seenTitle.get(title) ?? 0) + 1;
-    seenTitle.set(title, count);
-    if (count === 1) {
-      delete finding.occurrence;
-      return finding;
-    }
-    return { ...finding, occurrence: count };
-  });
+  return kept;
 }
 
 /** Default confidence floor for medium findings in the fix brief (PR gate stays stricter). */
@@ -980,7 +969,7 @@ export function mergeChecklistBody(existing: string | undefined, items: Checklis
 
 /**
  * Source of the checklist update used by the report-back command.
- * `current` and `edited` are in scope; the result is `next`.
+ * `current`, `edited`, and `original` are in scope; the result is `next`.
  */
 export const CHECKLIST_MERGE_SOURCE = `
 const re = /<!--\\s*fixbrief-ai-item:([^\\s>]+)\\s*-->/g;
@@ -997,10 +986,12 @@ const blocks = (body) => {
     return { fp: mark.fp, from, to: mark.end, text: body.slice(from, mark.end).trim() };
   });
 };
+const unchanged = new Map(blocks(original).map((item) => [item.fp, item.text]));
+const incoming = blocks(edited).filter((item) => unchanged.get(item.fp) !== item.text);
 let next = current;
 const live = blocks(next);
 const rows = [];
-for (const item of blocks(edited)) {
+for (const item of incoming) {
   const found = live.find((row) => row.fp === item.fp);
   if (found) rows.push({ item, found });
 }
@@ -1009,18 +1000,18 @@ for (const row of rows) {
   next = next.slice(0, row.found.from) + row.item.text + next.slice(row.found.to);
 }
 const have = new Set(blocks(next).map((row) => row.fp));
-for (const item of blocks(edited)) {
+for (const item of incoming) {
   if (!have.has(item.fp)) next = next.trimEnd() + "\\n\\n" + item.text + "\\n";
 }
 if (!next.endsWith("\\n")) next += "\\n";
 `.trim();
 
-/** Apply the edited checklist items onto the live comment, leaving its other text in place. */
-export function mergeChecklistReport(current: string, edited: string): string {
-  const run = new Function("current", "edited", `${CHECKLIST_MERGE_SOURCE}\nreturn next;`) as (
-    current: string, edited: string,
+/** Apply checklist items the agent changed. Items still equal to `original` stay as they are on the live comment. */
+export function mergeChecklistReport(current: string, edited: string, original = ""): string {
+  const run = new Function("current", "edited", "original", `${CHECKLIST_MERGE_SOURCE}\nreturn next;`) as (
+    current: string, edited: string, original: string,
   ) => string;
-  return run(current, edited);
+  return run(current, edited, original);
 }
 
 export function checklistCovers(existing: string | undefined, items: ChecklistItem[]): boolean {
@@ -1045,7 +1036,7 @@ export interface FixBriefTarget {
   line: number;
   endLine?: number;
   title: string;
-  /** Stable across runs. Line numbers are not part of it. */
+  /** Stable across runs. Built from the file, title, and line. */
   fingerprint: string;
   /** `thread` replies on a review comment. `checklist` updates the single checklist comment. */
   placement: "thread" | "checklist";

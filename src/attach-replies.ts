@@ -133,14 +133,17 @@ function checklistCommand(
   if (!checklist.id) {
     return `gh pr comment ${pr} --repo ${repo} --body ${shellSingleQuote(checklist.body)}`;
   }
-  const script = `const current = process.argv[1];\nconst edited = process.argv[2];\n${CHECKLIST_MERGE_SOURCE}\nprocess.stdout.write(next);\n`;
+  const script = `const current = process.argv[1];\nconst edited = process.argv[2];\nconst original = Buffer.from(process.argv[3] || "", "base64").toString("utf8");\n${CHECKLIST_MERGE_SOURCE}\nprocess.stdout.write(next);\n`;
+  const original = Buffer.from(checklist.body, "utf8").toString("base64");
   return [
     `if ! CURRENT="$(gh api "repos/${repo}/issues/comments/${checklist.id}" --jq .body)"; then`,
     `  echo "could not read checklist comment ${checklist.id}; not updating"`,
     `  exit 1`,
     "fi",
+    `# Edit the placeholders in EDITED only. ORIGINAL is the snapshot from this brief.`,
+    `ORIGINAL=${shellSingleQuote(original)}`,
     `EDITED=${shellSingleQuote(checklist.body)}`,
-    `if ! MERGED="$(node --input-type=module -e ${shellSingleQuote(script)} "$CURRENT" "$EDITED")"; then`,
+    `if ! MERGED="$(node --input-type=module -e ${shellSingleQuote(script)} "$CURRENT" "$EDITED" "$ORIGINAL")"; then`,
     `  echo "could not merge checklist comment ${checklist.id}; not updating"`,
     `  exit 1`,
     "fi",

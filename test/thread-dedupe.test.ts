@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checklistItemFromFinding, fingerprintMarker, githubReviewPayload, findingMarker } from "../src/findings.ts";
+import { checklistItemFromFinding, fingerprintMarker, githubReviewPayload, findingMarker, threadBaseFingerprint, threadFingerprint } from "../src/findings.ts";
 import { absorbFileCommentFailures, dedupeThreads } from "../src/thread-dedupe.ts";
 
 const sig = (o: any) => ({
@@ -54,6 +54,27 @@ test("absorbFileCommentFailures moves a rejected file comment onto the checklist
   assert.equal(absorbed.checklistAction, "create");
   assert.match(absorbed.checklistBody, /Off hunk/);
   assert.match(absorbed.payload.body, /could not be posted/);
+});
+
+test("removing one same-title finding still reuses the other finding's thread", () => {
+  const kept = sig({ id: "B", line: 12, title: "Shared", confidence: 0.9 }) as any;
+  const payload = githubReviewPayload([kept], 0.85);
+  const base = threadBaseFingerprint({ file: "a.py", title: "Shared" });
+  const stable = threadFingerprint({ file: "a.py", title: "Shared", line: 12 });
+  const result = dedupeThreads(payload, [
+    { commentId: 1, resolved: false, author: "github-actions", path: "a.py", line: 4, body: fingerprintMarker(base) },
+    { commentId: 2, resolved: false, author: "github-actions", path: "a.py", line: 12, body: fingerprintMarker(stable) },
+  ], undefined, { actor: "github-actions" });
+  assert.equal(result.payload.comments.length, 0);
+  assert.equal(result.reused.length, 1);
+  assert.equal(result.reused[0].id, 2);
+  const primary = githubReviewPayload([sig({ id: "A", line: 4, title: "Shared", confidence: 0.99 }) as any], 0.85);
+  const primaryResult = dedupeThreads(primary, [
+    { commentId: 1, resolved: false, author: "github-actions", path: "a.py", line: 4, body: fingerprintMarker(base) },
+    { commentId: 2, resolved: false, author: "github-actions", path: "a.py", line: 12, body: fingerprintMarker(stable) },
+  ], undefined, { actor: "github-actions" });
+  assert.equal(primaryResult.payload.comments.length, 0);
+  assert.equal(primaryResult.reused[0].id, 1);
 });
 
 test("a matching fingerprint from another author is not reused", () => {

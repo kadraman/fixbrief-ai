@@ -16,7 +16,7 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $cu
         pageInfo { hasNextPage endCursor }
         nodes {
           isResolved
-          comments(first: 1) { nodes { databaseId body author { login } } }
+          comments(first: 1) { nodes { databaseId body path line author { login } } }
         }
       }
     }
@@ -32,7 +32,7 @@ interface ThreadPage {
           pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
           nodes?: Array<{
             isResolved?: boolean;
-            comments?: { nodes?: Array<{ databaseId?: number; body?: string; author?: { login?: string } | null }> };
+            comments?: { nodes?: Array<{ databaseId?: number; body?: string; path?: string; line?: number | null; author?: { login?: string } | null }> };
           }>;
         };
       };
@@ -56,6 +56,8 @@ export function parseThreadPage(page: ThreadPage): { threads: ExistingThread[]; 
       body: comment.body ?? "",
       resolved: node.isResolved === true,
       ...(author ? { author } : {}),
+      ...(comment.path ? { path: comment.path } : {}),
+      ...(typeof comment.line === "number" ? { line: comment.line } : {}),
     });
   }
   const next = connection?.pageInfo?.hasNextPage ? connection.pageInfo.endCursor ?? undefined : undefined;

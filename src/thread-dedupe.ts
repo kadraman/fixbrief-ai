@@ -2,7 +2,7 @@
 
 import {
   checklistCovers, findingMarker, fingerprintMarker, mergeChecklistBody, parseFindingMarker, parseFingerprintMarker,
-  rewriteGeneratedCommentCount,
+  rewriteGeneratedCommentCount, threadBaseFingerprint, threadKeyPath,
   type ChecklistItem, type GitHubReviewPayload,
 } from "./findings.ts";
 
@@ -12,6 +12,8 @@ export interface ExistingThread {
   resolved: boolean;
   /** Login of the thread's first comment. Threads from anyone else are not reused. */
   author?: string;
+  path?: string;
+  line?: number | null;
 }
 
 export interface ExistingChecklist {
@@ -55,16 +57,35 @@ export function isTrustedThread(thread: ExistingThread, actor: string | undefine
   return loginKey(thread.author) === loginKey(actor);
 }
 
-function openThreadsByFingerprint(threads: ExistingThread[], actor: string | undefined): Map<string, ExistingThread> {
-  const open = new Map<string, ExistingThread>();
-  for (const thread of threads) {
-    if (thread.resolved || !isTrustedThread(thread, actor)) continue;
-    const fingerprint = parseFingerprintMarker(thread.body);
-    if (!fingerprint) continue;
-    const existing = open.get(fingerprint);
-    if (!existing || thread.commentId > existing.commentId) open.set(fingerprint, thread);
-  }
-  return open;
+function newest(threads: ExistingThread[]): ExistingThread | undefined {
+  return threads.reduce<ExistingThread | undefined>((best, thread) => {
+    if (!best || thread.commentId > best.commentId) return thread;
+    return best;
+  }, undefined);
+}
+
+/**
+ * Match a finding to an unresolved trusted thread.
+ * An older review identified the first same-title finding by file and title alone.
+ * That thread is reused only when its path and line are this finding's path and line.
+ */
+export function reusableThread(
+  threads: ExistingThread[],
+  actor: string | undefined,
+  fingerprint: string,
+  base: string | undefined,
+  location?: { path?: string; line?: number },
+): ExistingThread | undefined {
+  const trusted = threads.filter((thread) => !thread.resolved && isTrustedThread(thread, actor));
+  const exact = trusted.filter((thread) => parseFingerprintMarker(thread.body) === fingerprint);
+  if (exact.length) return newest(exact);
+  if (!base || !location?.path || location.line === undefined) return undefined;
+  const legacy = trusted.filter((thread) => {
+    if (parseFingerprintMarker(thread.body) !== base) return false;
+    if (!thread.path || thread.line === undefined || thread.line === null) return false;
+    return threadKeyPath(thread.path) === threadKeyPath(location.path!) && thread.line === location.line;
+  });
+  return newest(legacy);
 }
 
 function stillOpenBlock(reused: ReusedThread[], repo?: string, pr?: string): string {
@@ -100,14 +121,19 @@ export function dedupeThreads(
   existingChecklist?: ExistingChecklist,
   link?: { repo?: string; pr?: string; actor?: string },
 ): DedupeResult {
-  const open = openThreadsByFingerprint(threads, link?.actor);
   const reused: ReusedThread[] = [];
   const seenReused = new Set<number>();
-  const keep = <T extends { body: string }>(comments: T[]): T[] => {
+  const keep = <T extends { body: string; path: string; line?: number }>(comments: T[]): T[] => {
     const kept: T[] = [];
     for (const comment of comments) {
       const fingerprint = parseFingerprintMarker(comment.body);
-      const existing = fingerprint ? open.get(fingerprint) : undefined;
+      const title = titleFromBody(comment.body);
+      const base = fingerprint && title !== "Finding"
+        ? threadBaseFingerprint({ file: comment.path, title })
+        : undefined;
+      const existing = fingerprint
+        ? reusableThread(threads, link?.actor, fingerprint, base, { path: comment.path, line: comment.line })
+        : undefined;
       if (!existing || !fingerprint) { kept.push(comment); continue; }
       if (!seenReused.has(existing.commentId)) {
         seenReused.add(existing.commentId);
@@ -126,7 +152,10 @@ export function dedupeThreads(
   const comments = keep(payload.comments);
   const fileComments = keep(payload.fileComments ?? []);
   const checklist = (payload.checklist ?? []).filter((item) => {
-    const existing = open.get(item.fingerprint);
+    const existing = reusableThread(
+      threads, link?.actor, item.fingerprint, threadBaseFingerprint(item),
+      { path: item.file, line: item.line },
+    );
     if (!existing) return true;
     if (!seenReused.has(existing.commentId)) {
       seenReused.add(existing.commentId);
