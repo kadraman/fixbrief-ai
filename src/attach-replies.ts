@@ -5,7 +5,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  parseFindingMarker, parseFingerprintMarker, reportMarker, threadFingerprint,
+  CHECKLIST_MERGE_SOURCE, parseFindingMarker, parseFingerprintMarker, reportMarker, threadFingerprint,
   type FixBriefTarget,
   type FixBriefTargetsFile,
   type GitHubReviewPayload,
@@ -85,14 +85,23 @@ function replyBodyPlaceholder(target: FixBriefTarget): string {
   ].join("\n");
 }
 
-/** Reply on a review thread once. A second run of the same brief sees the report marker and skips. */
+/**
+ * Reply on a review thread once.
+ * GitHub has no GET for the replies route, so this lists the pull request's review
+ * comments and keeps those whose `in_reply_to_id` is this thread. A failed lookup
+ * does not post.
+ */
 export function threadReplyCommand(
   repo: string, pr: string, commentId: number, body: string, fingerprint: string,
 ): string {
   const marker = reportMarker(fingerprint);
   return [
     `MARKER=${shellSingleQuote(marker)}`,
-    `if gh api --paginate "repos/${repo}/pulls/${pr}/comments/${commentId}/replies" --jq '.[].body' | grep -F -q "$MARKER"; then`,
+    `if ! REPLIES="$(gh api --paginate --slurp "repos/${repo}/pulls/${pr}/comments" --jq '[.[][] | select(.in_reply_to_id == ${commentId}) | .body] | join("\\n")')"; then`,
+    `  echo "could not read replies for review comment ${commentId}; not posting"`,
+    `  exit 1`,
+    "fi",
+    `if printf '%s\\n' "$REPLIES" | grep -F -q "$MARKER"; then`,
     `  echo "already reported on review comment ${commentId}"`,
     "else",
     `  gh api --method POST "repos/${repo}/pulls/${pr}/comments/${commentId}/replies" -f body=${shellSingleQuote(body)}`,
@@ -121,10 +130,26 @@ export function reportBackItem(
 function checklistCommand(
   repo: string, pr: string, checklist: { id?: number; body: string },
 ): string {
-  if (checklist.id) {
-    return `gh api --method PATCH "repos/${repo}/issues/comments/${checklist.id}" -f body=${shellSingleQuote(checklist.body)}`;
+  if (!checklist.id) {
+    return `gh pr comment ${pr} --repo ${repo} --body ${shellSingleQuote(checklist.body)}`;
   }
-  return `gh pr comment ${pr} --repo ${repo} --body ${shellSingleQuote(checklist.body)}`;
+  const script = `const current = process.argv[1];\nconst edited = process.argv[2];\n${CHECKLIST_MERGE_SOURCE}\nprocess.stdout.write(next);\n`;
+  return [
+    `if ! CURRENT="$(gh api "repos/${repo}/issues/comments/${checklist.id}" --jq .body)"; then`,
+    `  echo "could not read checklist comment ${checklist.id}; not updating"`,
+    `  exit 1`,
+    "fi",
+    `EDITED=${shellSingleQuote(checklist.body)}`,
+    `if ! MERGED="$(node --input-type=module -e ${shellSingleQuote(script)} "$CURRENT" "$EDITED")"; then`,
+    `  echo "could not merge checklist comment ${checklist.id}; not updating"`,
+    `  exit 1`,
+    "fi",
+    `if [ -z "$MERGED" ]; then`,
+    `  echo "checklist merge produced an empty body; not updating"`,
+    `  exit 1`,
+    "fi",
+    `gh api --method PATCH "repos/${repo}/issues/comments/${checklist.id}" -f body="$MERGED"`,
+  ].join("\n");
 }
 
 /** Markdown section appended to fix-brief.md with concrete gh reply commands. */
@@ -134,8 +159,8 @@ export function renderReportBackSection(
   checklist?: { id?: number; body: string },
 ): string {
   const matched = matchCommentIds(targetsFile.targets, comments);
-  const threads = targetsFile.targets.filter((target) => !isChecklistTarget(target));
-  const checklistTargets = targetsFile.targets.filter(isChecklistTarget);
+  const threads = targetsFile.targets.filter((target) => matched.has(target.id) || !isChecklistTarget(target));
+  const checklistTargets = targetsFile.targets.filter((target) => isChecklistTarget(target) && !matched.has(target.id));
   const lines = [
     "",
     "## Report back",

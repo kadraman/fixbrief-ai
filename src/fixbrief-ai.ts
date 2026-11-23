@@ -9,7 +9,7 @@ import {
   FIX_BRIEF_MEDIUM_CONFIDENCE, buildFixBriefTargets, categoriesLabel, filterByCategories,
   fixBriefFindings, formatFileListFooter, githubReviewPayload, parseCategories, parseResponse,
   parseSkippedEntry, publishableFindings, qualifiesForFixBrief, rankFindings, renderFinding, repairFindingsPrompt,
-  threadFingerprint,
+  distinctThreadFindings,
   type CategoryFilter, type Finding, type OverviewFile,
 } from "./findings.ts";
 import { clusterRuns, scoreFinding } from "./confidence.ts";
@@ -707,15 +707,9 @@ async function main(): Promise<number> {
   const targetsPath = join(args.outDir, "fix-brief-targets.json");
   if (existsSync(targetsPath)) rmSync(targetsPath);
   if (env("FIX_BRIEF", "true").toLowerCase() === "true" && !flags.has("--no-fix-brief")) {
-    const seenFingerprints = new Set<string>();
-    const forBriefFindings = fixBriefFindings(
+    const forBriefFindings = distinctThreadFindings(fixBriefFindings(
       [...anchored, ...fileLevel, ...unanchored], minimumConfidence, fixBriefMediumConfidence, requireMultiRun,
-    ).filter((finding) => {
-      const fingerprint = threadFingerprint(finding);
-      if (seenFingerprints.has(fingerprint)) return false;
-      seenFingerprints.add(fingerprint);
-      return true;
-    });
+    ));
     const forBrief = forBriefFindings.length
       ? forBriefFindings.map(safeRender).join("\n\n")
       : "NO_ACTIONABLE_FINDINGS";

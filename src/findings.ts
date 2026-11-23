@@ -54,6 +54,11 @@ export interface Finding {
   confidenceBreakdown?: ConfidenceBreakdown;
   /** Set when a disproof pass judged this finding. Absent when it was not checked. */
   refute?: RefuteNote;
+  /**
+   * Set for a later finding that shares a file and title with an earlier one.
+   * The first keeps a line-independent thread id so a later run can still find it.
+   */
+  occurrence?: number;
 }
 
 export interface GitHubReviewComment {
@@ -110,18 +115,22 @@ const icons: Record<FindingSeverity, string> = {
 /** Hidden marker on the one checklist issue comment. */
 export const CHECKLIST_MARKER = "<!-- fixbrief-ai-checklist -->";
 
-/** Path form used for cross-run thread identity. Ignores `./` and `a/` `b/` prefixes. */
+/** Path form used for cross-run thread identity. A leading `./` is ignored; `a/` and `b/` are real directories. */
 export function threadKeyPath(file: string): string {
-  return file.replace(/^\.\//, "").replace(/^[ab]\//, "");
+  return file.replace(/^\.\//, "");
 }
 
 export function normalizeThreadTitle(title: string): string {
   return title.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-/** Stable id for a finding across runs. Line numbers are omitted so a small edit is the same thread. */
-export function threadFingerprint(finding: { file: string; title: string }): string {
-  const key = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}`;
+/**
+ * Stable id for a finding across runs. The line is omitted so a small edit is the same thread.
+ * A later finding with the same file and title includes its line so it is not discarded.
+ */
+export function threadFingerprint(finding: { file: string; title: string; line?: number; occurrence?: number }): string {
+  const line = finding.occurrence && finding.occurrence > 1 && finding.line !== undefined ? `\0${finding.line}` : "";
+  const key = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}${line}`;
   return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
@@ -790,7 +799,7 @@ export function partitionInline(
   const qualify = (finding: Finding) =>
     qualifiesForInline(finding, minimumConfidence, requireMultiRun, fixBriefMediumConfidence);
   const belowConfidence = anchored.filter((finding) => !qualify(finding));
-  const ordered = uniqueThreadFindings(rankFindings(anchored.filter(qualify)));
+  const ordered = distinctThreadFindings(rankFindings(anchored.filter(qualify)));
   return {
     inline: maxComments > 0 ? ordered.slice(0, maxComments) : ordered,
     belowConfidence,
@@ -810,30 +819,43 @@ export function publishableFindings(
 ): { inline: Finding[]; fileLevel: Finding[]; unanchored: Finding[]; capped: Finding[]; all: Finding[] } {
   const qualify = (finding: Finding) =>
     qualifiesForFixBrief(finding, minimumConfidence, fixBriefMediumConfidence, requireMultiRun);
-  const fileSet = new Set(fileLevel);
-  const threadable = uniqueThreadFindings(rankFindings([...anchored, ...fileLevel].filter(qualify)));
+  const fileIds = new Set(fileLevel.map((finding) => finding.id));
+  const threadable = distinctThreadFindings(rankFindings([...anchored, ...fileLevel].filter(qualify)));
   const threads = maxComments > 0 ? threadable.slice(0, maxComments) : threadable;
   const capped = maxComments > 0 ? threadable.slice(maxComments) : [];
-  const gatedUnanchored = rankFindings(unanchored.filter(qualify));
-  const inline = threads.filter((finding) => !fileSet.has(finding));
-  const files = threads.filter((finding) => fileSet.has(finding));
+  const gatedUnanchored = distinctThreadFindings(rankFindings(unanchored.filter(qualify)));
+  const inline = threads.filter((finding) => !fileIds.has(finding.id));
+  const files = threads.filter((finding) => fileIds.has(finding.id));
   return {
     inline, fileLevel: files, unanchored: gatedUnanchored, capped,
     all: [...threads, ...gatedUnanchored, ...capped],
   };
 }
 
-/** Keep the first finding for each file+title. `findings` must already be ranked. */
-function uniqueThreadFindings(findings: Finding[]): Finding[] {
-  const seen = new Set<string>();
-  const unique: Finding[] = [];
+/**
+ * Keep every ranked finding that has its own line. The same file, title, and line
+ * stays one finding (the higher-ranked copy). A second line keeps its own thread id.
+ */
+export function distinctThreadFindings(findings: Finding[]): Finding[] {
+  const seenAt = new Set<string>();
+  const kept: Finding[] = [];
   for (const finding of findings) {
-    const fingerprint = threadFingerprint(finding);
-    if (seen.has(fingerprint)) continue;
-    seen.add(fingerprint);
-    unique.push(finding);
+    const at = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}\0${finding.line}`;
+    if (seenAt.has(at)) continue;
+    seenAt.add(at);
+    kept.push(finding);
   }
-  return unique;
+  const seenTitle = new Map<string, number>();
+  return kept.map((finding) => {
+    const title = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}`;
+    const count = (seenTitle.get(title) ?? 0) + 1;
+    seenTitle.set(title, count);
+    if (count === 1) {
+      delete finding.occurrence;
+      return finding;
+    }
+    return { ...finding, occurrence: count };
+  });
 }
 
 /** Default confidence floor for medium findings in the fix brief (PR gate stays stricter). */
@@ -954,6 +976,51 @@ export function mergeChecklistBody(existing: string | undefined, items: Checklis
   const missing = items.filter((item) => !present.has(item.fingerprint));
   if (!missing.length) return `${existing.trimEnd()}\n`;
   return `${existing.trimEnd()}\n\n${missing.map(renderChecklistItem).join("\n\n")}\n`;
+}
+
+/**
+ * Source of the checklist update used by the report-back command.
+ * `current` and `edited` are in scope; the result is `next`.
+ */
+export const CHECKLIST_MERGE_SOURCE = `
+const re = /<!--\\s*fixbrief-ai-item:([^\\s>]+)\\s*-->/g;
+const blocks = (body) => {
+  const marks = [...body.matchAll(re)].map((match) => ({
+    fp: match[1],
+    end: match.index + match[0].length,
+  }));
+  return marks.map((mark, index) => {
+    const prev = index === 0 ? body.indexOf("<!-- fixbrief-ai-checklist -->") : marks[index - 1].end;
+    let from = body.indexOf("\\n#### ", prev < 0 ? 0 : prev);
+    if (from < 0) from = prev < 0 ? 0 : prev;
+    else from += 1;
+    return { fp: mark.fp, from, to: mark.end, text: body.slice(from, mark.end).trim() };
+  });
+};
+let next = current;
+const live = blocks(next);
+const rows = [];
+for (const item of blocks(edited)) {
+  const found = live.find((row) => row.fp === item.fp);
+  if (found) rows.push({ item, found });
+}
+rows.sort((a, b) => b.found.from - a.found.from);
+for (const row of rows) {
+  next = next.slice(0, row.found.from) + row.item.text + next.slice(row.found.to);
+}
+const have = new Set(blocks(next).map((row) => row.fp));
+for (const item of blocks(edited)) {
+  if (!have.has(item.fp)) next = next.trimEnd() + "\\n\\n" + item.text + "\\n";
+}
+if (!next.endsWith("\\n")) next += "\\n";
+`.trim();
+
+/** Apply the edited checklist items onto the live comment, leaving its other text in place. */
+export function mergeChecklistReport(current: string, edited: string): string {
+  const run = new Function("current", "edited", `${CHECKLIST_MERGE_SOURCE}\nreturn next;`) as (
+    current: string, edited: string,
+  ) => string;
+  return run(current, edited);
 }
 
 export function checklistCovers(existing: string | undefined, items: ChecklistItem[]): boolean {

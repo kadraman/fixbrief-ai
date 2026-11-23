@@ -13,6 +13,7 @@ import { absorbFileCommentFailures, dedupeThreads, type DedupeResult, type Exist
 interface ExistingReview {
   threads?: ExistingThread[];
   checklist?: { id?: number; body?: string } | null;
+  actor?: string | null;
 }
 
 interface FileCommentJob {
@@ -78,7 +79,7 @@ function plan(args: string[]): void {
     payload,
     existing.threads ?? [],
     existing.checklist ?? undefined,
-    { repo: arg("--repo", args), pr: arg("--pr", args) },
+    { repo: arg("--repo", args), pr: arg("--pr", args), actor: existing.actor ?? undefined },
   );
   writePlan(outDir, result, arg("--head", args) ?? "", pending);
 }
@@ -90,13 +91,14 @@ function absorb(args: string[]): void {
     action: DedupeResult["checklistAction"]; commentId: number | null; body: string; includeInBrief: boolean;
   }>(join(outDir, "checklist-plan.json"));
   const failures = readJson<ChecklistItem[]>(requireArg("--failures", args));
+  const posted = readJson<{ quietReview?: boolean }>(join(outDir, "post-plan.json"));
   const current: DedupeResult = {
     payload,
     reused: [],
     checklistAction: planFile.action,
     checklistBody: planFile.body,
     checklistCommentId: planFile.commentId ?? undefined,
-    quietReview: postPlan.quietReview,
+    quietReview: posted.quietReview === true,
     includeChecklist: planFile.includeInBrief,
   };
   const existingPath = arg("--existing", args);
@@ -107,7 +109,6 @@ function absorb(args: string[]): void {
   result.quietReview = result.payload.comments.length === 0
     && result.payload.fileComments.length === 0
     && result.checklistAction === "skip";
-  void postPlan;
   writePlan(outDir, result, arg("--head", args) ?? "", arg("--pending", args) !== "false", false);
 }
 

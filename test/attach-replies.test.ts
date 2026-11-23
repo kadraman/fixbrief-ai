@@ -41,10 +41,14 @@ test("matchCommentIds accepts legacy reviewbrief markers", () => {
 
 test("reportBackItem replies once on a thread and does not invent a pull request comment", () => {
   const withId = reportBackItem(targets.targets[0], 1001, "owner/name", "42");
+  assert.match(withId.command, /in_reply_to_id == 1001/);
+  assert.match(withId.command, /--paginate --slurp/);
+  assert.match(withId.command, /could not read replies for review comment 1001; not posting/);
   assert.match(withId.command, /\/comments\/1001\/replies/);
   assert.match(withId.command, /Null check/);
   assert.match(withId.command, /already reported on review comment 1001/);
   assert.match(withId.command, /fixbrief-ai-report:/);
+  assert.ok(withId.command.indexOf("not posting") < withId.command.indexOf("/comments/1001/replies"));
   const without = reportBackItem(targets.targets[1], undefined, "owner/name", "42");
   assert.equal(without.command, "");
 });
@@ -58,6 +62,8 @@ test("renderReportBackSection replies on threads and updates one checklist comme
   assert.match(section, /\/comments\/1001\/replies/);
   assert.match(section, /Do not open any other pull request comment/);
   assert.match(section, /issues\/comments\/77/);
+  assert.match(section, /could not read checklist comment 77; not updating/);
+  assert.ok(section.indexOf("issues/comments/77\" --jq .body") < section.indexOf("method PATCH"));
   assert.equal(section.split("gh pr comment").length, 1);
   const unmatched = renderReportBackSection(targets, []);
   assert.match(unmatched, /no review thread was posted/);

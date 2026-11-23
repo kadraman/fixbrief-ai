@@ -9,13 +9,14 @@ import { CHECKLIST_MARKER } from "./findings.ts";
 import type { ExistingThread } from "./thread-dedupe.ts";
 
 const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  viewer { login }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       reviewThreads(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
         nodes {
           isResolved
-          comments(first: 1) { nodes { databaseId body } }
+          comments(first: 1) { nodes { databaseId body author { login } } }
         }
       }
     }
@@ -24,13 +25,14 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $cu
 
 interface ThreadPage {
   data?: {
+    viewer?: { login?: string };
     repository?: {
       pullRequest?: {
         reviewThreads?: {
           pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
           nodes?: Array<{
             isResolved?: boolean;
-            comments?: { nodes?: Array<{ databaseId?: number; body?: string }> };
+            comments?: { nodes?: Array<{ databaseId?: number; body?: string; author?: { login?: string } | null }> };
           }>;
         };
       };
@@ -39,7 +41,7 @@ interface ThreadPage {
   errors?: Array<{ message?: string }>;
 }
 
-export function parseThreadPage(page: ThreadPage): { threads: ExistingThread[]; next?: string } {
+export function parseThreadPage(page: ThreadPage): { threads: ExistingThread[]; next?: string; actor?: string } {
   if (page.errors?.length) {
     throw new Error(page.errors.map((error) => error.message || "GraphQL error").join("; "));
   }
@@ -48,14 +50,16 @@ export function parseThreadPage(page: ThreadPage): { threads: ExistingThread[]; 
   for (const node of connection?.nodes ?? []) {
     const comment = node.comments?.nodes?.[0];
     if (!comment?.databaseId) continue;
+    const author = comment.author?.login;
     threads.push({
       commentId: comment.databaseId,
       body: comment.body ?? "",
       resolved: node.isResolved === true,
+      ...(author ? { author } : {}),
     });
   }
   const next = connection?.pageInfo?.hasNextPage ? connection.pageInfo.endCursor ?? undefined : undefined;
-  return { threads, next };
+  return { threads, next, actor: page.data?.viewer?.login };
 }
 
 function gh(args: string[], input?: string): string {
@@ -66,8 +70,9 @@ function gh(args: string[], input?: string): string {
   return result.stdout;
 }
 
-function fetchThreads(owner: string, name: string, pr: number): ExistingThread[] {
+function fetchThreads(owner: string, name: string, pr: number): { threads: ExistingThread[]; actor?: string } {
   const threads: ExistingThread[] = [];
+  let actor: string | undefined;
   let cursor: string | null = null;
   do {
     const page = JSON.parse(gh(["api", "graphql", "--input", "-"], JSON.stringify({
@@ -76,9 +81,10 @@ function fetchThreads(owner: string, name: string, pr: number): ExistingThread[]
     }))) as ThreadPage;
     const parsed = parseThreadPage(page);
     threads.push(...parsed.threads);
+    actor ??= parsed.actor;
     cursor = parsed.next ?? null;
   } while (cursor);
-  return threads;
+  return { threads, actor };
 }
 
 /** `gh api --paginate` prints one JSON array per page with no separator. */
@@ -128,9 +134,10 @@ function main(): void {
   }
   const [owner, name] = repo.split("/");
   if (!owner || !name) throw new Error(`repo must be OWNER/NAME, got ${repo}`);
-  const threads = fetchThreads(owner, name, Number(pr));
+  const { threads, actor } = fetchThreads(owner, name, Number(pr));
+  if (!actor) console.warn("Could not read the authenticated login; existing threads will not be reused.");
   const checklist = fetchChecklist(repo, Number(pr));
-  writeFileSync(out, JSON.stringify({ threads, checklist }, null, 2));
+  writeFileSync(out, JSON.stringify({ threads, checklist, actor: actor ?? null }, null, 2));
   console.log(`Fetched ${threads.length} review thread(s)${checklist ? ` and checklist comment ${checklist.id}` : ""}.`);
 }
 

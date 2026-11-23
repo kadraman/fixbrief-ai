@@ -1,7 +1,7 @@
 /** Drop review comments that already have an unresolved thread with the same fingerprint. */
 
 import {
-  checklistCovers, mergeChecklistBody, parseFindingMarker, parseFingerprintMarker,
+  checklistCovers, findingMarker, fingerprintMarker, mergeChecklistBody, parseFindingMarker, parseFingerprintMarker,
   rewriteGeneratedCommentCount,
   type ChecklistItem, type GitHubReviewPayload,
 } from "./findings.ts";
@@ -10,6 +10,8 @@ export interface ExistingThread {
   commentId: number;
   body: string;
   resolved: boolean;
+  /** Login of the thread's first comment. Threads from anyone else are not reused. */
+  author?: string;
 }
 
 export interface ExistingChecklist {
@@ -43,10 +45,20 @@ function titleFromBody(body: string): string {
   return match?.[1]?.trim() || "Finding";
 }
 
-function openThreadsByFingerprint(threads: ExistingThread[]): Map<string, ExistingThread> {
+function loginKey(login: string): string {
+  return login.trim().toLowerCase().replace(/\[bot\]$/, "");
+}
+
+/** True when this thread was opened by the account that is posting the review. */
+export function isTrustedThread(thread: ExistingThread, actor: string | undefined): boolean {
+  if (!actor || !thread.author) return false;
+  return loginKey(thread.author) === loginKey(actor);
+}
+
+function openThreadsByFingerprint(threads: ExistingThread[], actor: string | undefined): Map<string, ExistingThread> {
   const open = new Map<string, ExistingThread>();
   for (const thread of threads) {
-    if (thread.resolved) continue;
+    if (thread.resolved || !isTrustedThread(thread, actor)) continue;
     const fingerprint = parseFingerprintMarker(thread.body);
     if (!fingerprint) continue;
     const existing = open.get(fingerprint);
@@ -86,9 +98,9 @@ export function dedupeThreads(
   payload: GitHubReviewPayload,
   threads: ExistingThread[],
   existingChecklist?: ExistingChecklist,
-  link?: { repo?: string; pr?: string },
+  link?: { repo?: string; pr?: string; actor?: string },
 ): DedupeResult {
-  const open = openThreadsByFingerprint(threads);
+  const open = openThreadsByFingerprint(threads, link?.actor);
   const reused: ReusedThread[] = [];
   const seenReused = new Set<number>();
   const keep = <T extends { body: string }>(comments: T[]): T[] => {
@@ -113,7 +125,21 @@ export function dedupeThreads(
   };
   const comments = keep(payload.comments);
   const fileComments = keep(payload.fileComments ?? []);
-  const checklist = payload.checklist ?? [];
+  const checklist = (payload.checklist ?? []).filter((item) => {
+    const existing = open.get(item.fingerprint);
+    if (!existing) return true;
+    if (!seenReused.has(existing.commentId)) {
+      seenReused.add(existing.commentId);
+      reused.push({
+        id: existing.commentId,
+        body: `${findingMarker(item.id)}\n${fingerprintMarker(item.fingerprint)}\n${item.title}`,
+        findingId: item.id,
+        fingerprint: item.fingerprint,
+        title: item.title,
+      });
+    }
+    return false;
+  });
   const covered = checklistCovers(existingChecklist?.body, checklist);
   const checklistAction: DedupeResult["checklistAction"] = checklist.length === 0 || covered
     ? "skip"

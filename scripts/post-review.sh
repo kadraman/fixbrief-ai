@@ -48,13 +48,13 @@ FILE_COUNT="$(plan_get fileCount)"
 save_review_comments() {
   local id="$1"
   if [ -z "$id" ]; then return; fi
-  if RAW="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews/$id/comments")"; then
+  if RAW="$(gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/reviews/$id/comments")"; then
     printf '%s' "$RAW" | node --input-type=module -e '
       import { readFileSync, writeFileSync } from "node:fs";
       const raw = readFileSync(0, "utf8").trim();
-      let rows = [];
-      try { rows = JSON.parse(raw || "[]"); } catch { rows = []; }
-      if (!Array.isArray(rows)) rows = [];
+      let pages = [];
+      try { pages = JSON.parse(raw || "[]"); } catch { pages = []; }
+      const rows = Array.isArray(pages) ? pages.flat() : [];
       writeFileSync(process.argv[1], JSON.stringify(rows.map((comment) => ({
         id: comment.id, body: comment.body || "", path: comment.path, line: comment.line ?? null,
       })), null, 2));

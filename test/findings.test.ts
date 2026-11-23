@@ -6,7 +6,7 @@ import {
   parseCategories, parseFindingMarker, parseResponse, parseSkippedEntry, partitionInline,
   payloadHasContent, publishableFindings, qualifiesForFixBrief, qualifiesForInline,
   rankFindings, renderFinding, repairFindingsPrompt, reviewOverviewBody,
-  checklistItemFromFinding, mergeChecklistBody, threadFingerprint,
+  checklistItemFromFinding, mergeChecklistBody, mergeChecklistReport, renderChecklistBody, threadFingerprint,
 } from "../src/findings.ts";
 import { reviewSystemPrompt } from "../src/fixbrief-ai.ts";
 
@@ -415,11 +415,34 @@ test("file-level findings become file comments; files outside the diff become ch
   assert.match(payload.body, /generated 1 comment/);
 });
 
-test("thread fingerprint ignores line number and path prefix", () => {
+test("thread fingerprint ignores line number and a leading dot-slash, and keeps a/ and b/ directories", () => {
   const left = threadFingerprint({ file: "./a.py", title: "Keep  Harmonics" });
   const right = threadFingerprint({ file: "a.py", title: "keep harmonics" });
   assert.equal(left, right);
+  assert.equal(left, threadFingerprint({ file: "a.py", line: 40, title: "keep harmonics" }));
   assert.notEqual(left, threadFingerprint({ file: "a.py", title: "other" }));
+  assert.notEqual(
+    threadFingerprint({ file: "a/config.ts", title: "Same" }),
+    threadFingerprint({ file: "b/config.ts", title: "Same" }),
+  );
+  assert.notEqual(
+    threadFingerprint({ file: "a/config.ts", title: "Same" }),
+    threadFingerprint({ file: "config.ts", title: "Same" }),
+  );
+});
+
+test("two findings with the same file and title at different lines both stay in the review", () => {
+  const payload = githubReviewPayload([
+    sig({ id: "A", line: 4, title: "Shared", confidence: 0.9 }),
+    sig({ id: "B", line: 12, title: "Shared", confidence: 0.86 }),
+    sig({ id: "C", line: 4, title: "Shared", confidence: 0.99 }),
+  ] as any, 0.85);
+  assert.equal(payload.comments.length, 2);
+  const fingerprints = payload.comments.map((comment) => comment.body.match(/fixbrief-ai-fp:([^\s>]+)/)?.[1]);
+  assert.equal(fingerprints[0], threadFingerprint({ file: "a.py", title: "Shared" }));
+  assert.notEqual(fingerprints[0], fingerprints[1]);
+  assert.match(payload.comments.map((comment) => comment.body).join("\n"), /fixbrief-ai:A|fixbrief-ai:C/);
+  assert.match(payload.comments.map((comment) => comment.body).join("\n"), /fixbrief-ai:B/);
 });
 
 test("mergeChecklistBody appends new items and keeps text the agent already wrote", () => {
@@ -434,4 +457,19 @@ test("mergeChecklistBody appends new items and keeps text the agent already wrot
   assert.match(merged, /#### high: Second/);
   assert.equal(merged.split("fixbrief-ai-checklist").length, 2);
   assert.equal(mergeChecklistBody(merged, [first, second]), `${merged.trimEnd()}\n`);
+});
+
+test("mergeChecklistReport keeps the download link and later checklist edits", () => {
+  const first = checklistItemFromFinding(sig({ id: "RB1", title: "First", file: "a.py", line: 1 }) as any);
+  const later = checklistItemFromFinding(sig({ id: "RB9", title: "Later", file: "c.py", line: 3 }) as any);
+  const current = `${renderChecklistBody([first, later]).trimEnd()}\n\n**Fix brief:** [download fix-brief.md](https://example.com/brief)\n`;
+  const edited = renderChecklistBody([first]).replace(
+    "<what you fixed, or why you skipped this finding>",
+    "Fixed the first one.",
+  );
+  const merged = mergeChecklistReport(current, edited);
+  assert.match(merged, /Fixed the first one\./);
+  assert.match(merged, /#### high: Later/);
+  assert.match(merged, /download fix-brief\.md/);
+  assert.equal(merged.split("<what you fixed").length, 2);
 });
