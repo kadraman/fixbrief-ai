@@ -122,6 +122,8 @@ function reconcilesAsGroup(claims: ThreadClaim[], threads: ExistingThread[], bas
  * agrees with the thread's current line. One finding that lost its line, or
  * moved between a line comment and a file comment, reuses the single open
  * thread for that file and title.
+ * Accepted outcomes are the "thread reuse policy" test. A scenario that asks
+ * for the opposite pairing is a policy change, not a defect here.
  */
 function assignOpenThreads(
   claims: ThreadClaim[],

@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checklistItemFromFinding, fingerprintMarker, githubReviewPayload, findingMarker, threadBaseFingerprint, threadFingerprint } from "../src/findings.ts";
+import { checklistItemFromFinding, fingerprintMarker, githubReviewPayload, findingMarker, mergeChecklistBody, threadBaseFingerprint, threadFingerprint } from "../src/findings.ts";
 import { absorbFileCommentFailures, dedupeThreads } from "../src/thread-dedupe.ts";
 
 const sig = (o: any) => ({
@@ -255,4 +255,87 @@ test("absorb reads post-plan.json and keeps a rejected file comment on the check
   const plan = JSON.parse(readFileSync(join(dir, "checklist-plan.json"), "utf8"));
   assert.equal(plan.action, "create");
   assert.match(plan.body, /Off hunk/);
+});
+
+function lineThread(line: number, title = "Shared", commentId = line) {
+  return {
+    commentId, resolved: false, author: "github-actions", path: "a.py", line,
+    body: `**${title}**\n\n${fingerprintMarker(threadFingerprint({ file: "a.py", title, line: commentId === line ? line : commentId }))}`,
+  };
+}
+
+/**
+ * Specification for matching a new finding to an open thread or checklist entry.
+ * A review finding that asks for the opposite result is a policy change, not a defect.
+ */
+test("thread reuse policy", () => {
+  const actor = { actor: "github-actions" };
+  const shared = (id: string, line: number) => sig({ id, line, title: "Shared", confidence: 0.99 }) as any;
+  const reuse = (findings: any[], threads: any[]) => dedupeThreads(githubReviewPayload(findings, 0.85), threads, undefined, actor);
+  const pair = (result: ReturnType<typeof dedupeThreads>, id: string) => result.reused.find((item) => item.findingId === id)?.id;
+
+  const near = reuse([shared("A", 12)], [lineThread(10)]);
+  assert.equal(near.payload.comments.length, 0);
+  assert.equal(pair(near, "A"), 10);
+
+  const far = reuse([shared("NEW", 500)], [lineThread(10)]);
+  assert.equal(far.payload.comments.length, 1);
+  assert.equal(far.reused.length, 0);
+
+  const shifted = reuse([shared("A", 12), shared("B", 32)], [lineThread(10), lineThread(30)]);
+  assert.equal(shifted.payload.comments.length, 0);
+  assert.equal(pair(shifted, "A"), 10);
+  assert.equal(pair(shifted, "B"), 30);
+
+  const passed = reuse([shared("A", 12), shared("B", 14)], [lineThread(10), lineThread(12)]);
+  assert.equal(pair(passed, "A"), 10);
+  assert.equal(pair(passed, "B"), 12);
+
+  const tracked = dedupeThreads(githubReviewPayload([shared("A", 12), shared("B", 14)], 0.85), [
+    { ...lineThread(12, "Shared", 10), body: `**Shared**\n\n${fingerprintMarker(threadFingerprint({ file: "a.py", title: "Shared", line: 10 }))}` },
+    { ...lineThread(14, "Shared", 12), body: `**Shared**\n\n${fingerprintMarker(threadFingerprint({ file: "a.py", title: "Shared", line: 12 }))}` },
+  ], undefined, actor);
+  assert.equal(pair(tracked, "A"), 10);
+  assert.equal(pair(tracked, "B"), 12);
+
+  const exactLosesToSharedOffset = reuse([shared("A", 20), shared("B", 30)], [lineThread(10), lineThread(20)]);
+  assert.equal(exactLosesToSharedOffset.payload.comments.length, 0);
+  assert.equal(pair(exactLosesToSharedOffset, "A"), 10);
+  assert.equal(pair(exactLosesToSharedOffset, "B"), 20);
+
+  const clearedNear = dedupeThreads(githubReviewPayload([shared("A", 12)], 0.85), [{
+    ...lineThread(10), line: null, originalLine: 10,
+  }], undefined, actor);
+  assert.equal(clearedNear.payload.comments.length, 0);
+  assert.equal(pair(clearedNear, "A"), 10);
+  const clearedFar = dedupeThreads(githubReviewPayload([shared("NEW", 500)], 0.85), [{
+    ...lineThread(10), line: null, originalLine: 10,
+  }], undefined, actor);
+  assert.equal(clearedFar.payload.comments.length, 1);
+  assert.equal(clearedFar.reused.length, 0);
+
+  const filePayload = githubReviewPayload([], 0.85, Number.POSITIVE_INFINITY, undefined, [], false, {}, 0.75, [
+    sig({ id: "A", title: "Off hunk", line: 80 }) as any,
+  ]);
+  const fromLine = dedupeThreads(filePayload, [lineThread(40, "Off hunk")], undefined, actor);
+  assert.equal(fromLine.payload.fileComments.length, 0);
+  assert.equal(fromLine.reused[0].id, 40);
+  const legacy = dedupeThreads(filePayload, [{
+    commentId: 44, resolved: false, author: "github-actions", path: "a.py",
+    body: `**Off hunk**\n\n${fingerprintMarker(threadBaseFingerprint({ file: "a.py", title: "Off hunk" }))}`,
+  }], undefined, actor);
+  assert.equal(legacy.payload.fileComments.length, 0);
+  assert.equal(legacy.reused[0].id, 44);
+
+  const original = checklistItemFromFinding(sig({ id: "RB1", title: "Moved", file: "a.py", line: 10 }) as any);
+  const existing = mergeChecklistBody(undefined, [original]);
+  const movedItem = mergeChecklistBody(existing, [
+    checklistItemFromFinding(sig({ id: "RB2", title: "Moved", file: "a.py", line: 12 }) as any),
+  ]);
+  assert.equal(movedItem.split("fixbrief-ai-item:").length, 2);
+  const distantItem = mergeChecklistBody(existing, [
+    checklistItemFromFinding(sig({ id: "RB3", title: "Moved", file: "a.py", line: 500 }) as any),
+  ]);
+  assert.equal(distantItem.split("fixbrief-ai-item:").length, 3);
+  assert.match(distantItem, /`a.py:500`/);
 });

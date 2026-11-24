@@ -966,6 +966,7 @@ export interface LocationRef {
  * A single finding is reused only when it stays in this neighborhood.
  * A wider gap is a different finding unless several same-title findings move
  * by the same amount, which is evidence that one edit shifted them together.
+ * The boundary is locked by the "thread reuse policy" test.
  */
 export const LONE_LINE_SHIFT = 15;
 
@@ -1068,6 +1069,7 @@ function chooseShift<T, U>(uniform: ShiftMatch<T, U> | null, local: ShiftMatch<T
  * Pair items that share a file and title. Each side is used once, in line order.
  * A lone far jump is left unmatched. Several findings that share one offset stay
  * with their own entries, including when one of them lands on another's old line.
+ * Accepted outcomes are the "thread reuse policy" test.
  */
 export function matchByLocation<T extends LocationRef, U extends LocationRef>(current: T[], existing: U[]): Map<string, U> {
   const result = new Map<string, U>();
