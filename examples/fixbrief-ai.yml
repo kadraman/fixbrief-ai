@@ -8,9 +8,11 @@
 #
 # On opened/reopened the action reviews the full PR against the PR head SHA.
 # On synchronize it reviews only the new commits (before...PR head) when that
-# SHA is still an ancestor of the new head; if nothing meets the publish gate,
-# it stays silent so the earlier review remains. Inline comments are anchored
-# to GitHub's PR diff even when the model sees extra context lines.
+# SHA is still an ancestor of the new head. If every finding already has an
+# unresolved review thread, it stays silent so the earlier review remains.
+# Critical/high and fix-brief medium findings are review threads. A file that
+# is in the diff but whose line is not commentable gets a file comment; other
+# unplaceable findings share one checklist comment.
 # Default consistency-runs is 2: agreement adjusts confidence; critical/high that
 # clear the floor still publish as one-offs. refute defaults to true: one extra
 # call can drop a publishable finding when the checkout shows it is false.

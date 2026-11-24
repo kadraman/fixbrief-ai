@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /** Canonical Finding model and GitHub review comment renderer. */
 
+import { createHash } from "node:crypto";
+
 /** Canonical finding categories. Style / formatting / lint nits are out of scope. */
 export const FINDING_CATEGORIES = [
   "security", "quality", "maintainability", "performance",
@@ -61,12 +63,41 @@ export interface GitHubReviewComment {
   start_line?: number;
   start_side?: "RIGHT";
   body: string;
+  /** Not sent to the create-review API. Used if that call fails and the finding joins the checklist. */
+  fallback?: ChecklistItem;
+}
+
+/** A review comment on a whole file. Posted separately; create-review does not accept subject_type. */
+export interface GitHubFileComment {
+  path: string;
+  body: string;
+  subject_type: "file";
+  /** Not sent to GitHub. Used when the file-comment API rejects the comment. */
+  fallback: ChecklistItem;
+}
+
+/** One fix-brief finding that cannot be a review thread, collected into a single issue comment. */
+export interface ChecklistItem {
+  id: string;
+  fingerprint: string;
+  severity: FindingSeverity;
+  file: string;
+  line: number;
+  endLine?: number;
+  title: string;
+  description: string;
+  recommendation?: string;
 }
 
 export interface GitHubReviewPayload {
   event: "COMMENT";
   body: string;
+  /** Line comments. Safe to send as create-review `comments` after `fallback` is stripped. */
   comments: GitHubReviewComment[];
+  /** File-level review comments for findings whose file is in the diff but whose line is not. */
+  fileComments: GitHubFileComment[];
+  /** Findings that could not be threaded, including cap overflow. One checklist comment holds all of them. */
+  checklist: ChecklistItem[];
 }
 
 const CATEGORIES = new Set<string>(FINDING_CATEGORIES);
@@ -75,6 +106,63 @@ const severities: FindingSeverity[] = ["critical", "high", "medium", "low", "inf
 const icons: Record<FindingSeverity, string> = {
   critical: "🚨", high: "⚠️", medium: "🔶", low: "💡", info: "ℹ️",
 };
+
+/** Hidden marker on the one checklist issue comment. */
+export const CHECKLIST_MARKER = "<!-- fixbrief-ai-checklist -->";
+
+/** Path form used for cross-run thread identity. A leading `./` is ignored; `a/` and `b/` are real directories. */
+export function threadKeyPath(file: string): string {
+  return file.replace(/^\.\//, "");
+}
+
+export function normalizeThreadTitle(title: string): string {
+  return title.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/** File and title only. Older reviews used this for the first finding that shared a title. */
+export function threadBaseFingerprint(finding: { file: string; title: string }): string {
+  const key = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}`;
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+/** Stable id for one finding. The line keeps same-title findings apart; reuse across a line shift is decided at match time. */
+export function threadFingerprint(finding: { file: string; title: string; line?: number }): string {
+  const line = finding.line !== undefined ? `\0${finding.line}` : "";
+  const key = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}${line}`;
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+export function fingerprintMarker(fingerprint: string): string {
+  return `<!-- fixbrief-ai-fp:${fingerprint.replace(/-->/g, "")} -->`;
+}
+
+export function parseFingerprintMarker(body: string): string | undefined {
+  const match = /<!--\s*fixbrief-ai-fp:([^\s>]+)\s*-->/.exec(body);
+  return match?.[1];
+}
+
+export function checklistItemMarker(fingerprint: string): string {
+  return `<!-- fixbrief-ai-item:${fingerprint.replace(/-->/g, "")} -->`;
+}
+
+/** Marker on an agent's report-back reply, so running the brief twice does not post a second reply. */
+export function reportMarker(fingerprint: string): string {
+  return `<!-- fixbrief-ai-report:${fingerprint.replace(/-->/g, "")} -->`;
+}
+
+export function checklistItemFromFinding(finding: Finding): ChecklistItem {
+  return {
+    id: finding.id,
+    fingerprint: threadFingerprint(finding),
+    severity: finding.severity,
+    file: finding.file,
+    line: finding.line,
+    endLine: finding.endLine,
+    title: finding.title,
+    description: finding.description,
+    recommendation: finding.recommendation,
+  };
+}
 
 /**
  * Parse a comma/space-separated category allowlist.
@@ -286,9 +374,11 @@ const MIN_RECOMMENDATION = 60;
 const MIN_TITLE = 24;
 
 /** Render one concise, bounded GitHub review comment. Prefer keeping a GitHub suggestion by shrinking prose first. */
-export function renderFinding(finding: Finding, maxLength = 800): string {
+export function renderFinding(
+  finding: Finding, maxLength = 800, options?: { suggestion?: boolean },
+): string {
   // Copilot-style: severity top-right, prose body, optional suggestion. No confidence percentage.
-  const marker = findingMarker(finding.id);
+  const marker = `${findingMarker(finding.id)}\n${fingerprintMarker(threadFingerprint(finding))}`;
   const fullTitle = finding.title.trim();
   const fullDescription = finding.description.trim();
   const fullRecommendation = finding.recommendation?.trim() ?? "";
@@ -327,7 +417,7 @@ export function renderFinding(finding: Finding, maxLength = 800): string {
     return body;
   };
 
-  let includeSuggestion = Boolean(suggestion);
+  let includeSuggestion = options?.suggestion === false ? false : Boolean(suggestion);
   let body = shrinkProse(includeSuggestion);
   // If a suggestion still cannot fit after prose is at the readable floors, drop it and
   // restore full prose. Never truncate mid-fence — an incomplete suggestion absorbs Markdown.
@@ -362,9 +452,50 @@ export function toReviewComment(finding: Finding, body: string): GitHubReviewCom
   const range = finding.endLine !== undefined && finding.endLine > finding.line;
   const comment: GitHubReviewComment = {
     path: finding.file, line: range ? (finding.endLine as number) : finding.line, side: "RIGHT", body,
+    fallback: checklistItemFromFinding(finding),
   };
   if (range) { comment.start_line = finding.line; comment.start_side = "RIGHT"; }
   return comment;
+}
+
+export function toFileComment(finding: Finding, body: string): GitHubFileComment {
+  return {
+    path: finding.file,
+    body,
+    subject_type: "file",
+    fallback: checklistItemFromFinding(finding),
+  };
+}
+
+/**
+ * create-review body. Drops fields GitHub's comments array rejects.
+ * Omitting `event` leaves the review pending. The string "PENDING" is not a
+ * valid event and returns HTTP 422, so the later submit never runs.
+ */
+export function createReviewRequest(payload: GitHubReviewPayload, pending: boolean): {
+  event?: "COMMENT";
+  body?: string;
+  comments?: Array<{ path: string; line: number; side: "RIGHT"; body: string; start_line?: number; start_side?: "RIGHT" }>;
+} {
+  const comments = payload.comments.map((comment) => {
+    const out: { path: string; line: number; side: "RIGHT"; body: string; start_line?: number; start_side?: "RIGHT" } = {
+      path: comment.path, line: comment.line, side: "RIGHT", body: comment.body,
+    };
+    if (comment.start_line !== undefined) {
+      out.start_line = comment.start_line;
+      out.start_side = "RIGHT";
+    }
+    return out;
+  });
+  if (pending) return comments.length ? { comments } : {};
+  return { event: "COMMENT", body: payload.body, comments };
+}
+
+/** File-comment API body. `subject_type` is not valid on create-review. */
+export function fileCommentRequest(comment: GitHubFileComment, commitId: string): {
+  body: string; commit_id: string; path: string; subject_type: "file";
+} {
+  return { body: comment.body, commit_id: commitId, path: comment.path, subject_type: "file" };
 }
 
 function findingFingerprint(finding: Finding): string {
@@ -401,9 +532,9 @@ export interface OverviewFile {
 export interface OverviewSections {
   unanchored?: Finding[];
   capped?: Finding[];
-  /** Fix-brief findings that are not already shown as inline / unanchored / capped. */
-  alsoInBrief?: Finding[];
-  /** Scored findings that did not meet the publish gate (severity/confidence). */
+  /** File-level review comments. Counted in the overview; they are threads, not a summary section. */
+  fileLevel?: Finding[];
+  /** Scored findings that did not meet the thread gate (severity/confidence). */
   belowGateCount?: number;
   /** Pull request title used in the overview. */
   title?: string;
@@ -413,10 +544,12 @@ export interface OverviewSections {
   files?: OverviewFile[];
 }
 
-/** Whether the payload has anything worth posting (inline comments or gated summary sections). */
+/** Whether the payload has anything worth posting (threads, a checklist, or a gated summary section). */
 export function payloadHasContent(payload: GitHubReviewPayload): boolean {
   if (payload.comments.length > 0) return true;
-  return /### Could not place inline|### Over the inline cap|### Also in the fix brief/.test(payload.body);
+  if ((payload.fileComments?.length ?? 0) > 0) return true;
+  if ((payload.checklist?.length ?? 0) > 0) return true;
+  return /### Could not place on a changed file|### Over the inline cap/.test(payload.body);
 }
 
 /** One path (and optional skip reason) for a collapsible file-list footer. */
@@ -556,18 +689,15 @@ export function reviewOverviewBody(
 ): string {
   const unanchored = sections.unanchored ?? [];
   const capped = sections.capped ?? [];
-  const alsoInBrief = sections.alsoInBrief ?? [];
+  const fileLevel = sections.fileLevel ?? [];
   const belowGateCount = sections.belowGateCount ?? 0;
   const files = sections.files ?? [];
   const reviewedCount = files.filter((file) => file.reviewed).length;
   const totalFiles = files.length;
-  const commentCount = inline.length;
+  const commentCount = inline.length + fileLevel.length;
   const title = (sections.title ?? "").trim();
   const paragraph = firstOverviewParagraph(sections.body ?? "");
   const changes = changeBullets(sections);
-  const briefExtra = alsoInBrief.length
-    ? `, plus ${alsoInBrief.length} more finding${alsoInBrief.length === 1 ? "" : "s"} summarised below and included in the fix brief`
-    : "";
 
   const parts = ["## FixBrief AI review", ""];
   if (title) parts.push(title, "");
@@ -576,12 +706,12 @@ export function reviewOverviewBody(
   parts.push(
     "**Reviewed changes**",
     "",
-    `FixBrief AI reviewed ${reviewedCount} out of ${totalFiles || reviewedCount || "?"} changed file${(totalFiles || reviewedCount) === 1 ? "" : "s"} in this pull request and generated ${commentCount} comment${commentCount === 1 ? "" : "s"}${briefExtra}.`,
+    `FixBrief AI reviewed ${reviewedCount} out of ${totalFiles || reviewedCount || "?"} changed file${(totalFiles || reviewedCount) === 1 ? "" : "s"} in this pull request and generated ${commentCount} comment${commentCount === 1 ? "" : "s"}.`,
     "",
   );
-  if (!inline.length) {
+  if (!commentCount) {
     parts.push(
-      `_No inline findings met the publish gate (critical/high at or above the confidence floor)._`,
+      `_No findings met the thread gate (critical/high at or above the confidence floor, or medium findings in the fix brief)._`,
       "",
     );
     if (belowGateCount > 0) {
@@ -596,9 +726,9 @@ export function reviewOverviewBody(
   void minimumConfidence;
   if (unanchored.length) {
     parts.push(
-      "### Could not place inline",
+      "### Could not place on a changed file",
       "",
-      "_Critical/high findings at or above the confidence floor whose line is not on the reviewed diff._",
+      "_These findings are in the fix brief, but the file is not part of this pull request diff. They are collected in one checklist comment._",
       "",
       ...unanchored.map(summaryFindingBullet),
       "",
@@ -608,19 +738,9 @@ export function reviewOverviewBody(
     parts.push(
       "### Over the inline cap",
       "",
-      "_Critical/high findings at or above the confidence floor that exceeded `max-inline-comments`._",
+      "_These findings exceeded `max-inline-comments`. They are collected in the checklist comment rather than opened as extra threads._",
       "",
       ...capped.map(summaryFindingBullet),
-      "",
-    );
-  }
-  if (alsoInBrief.length) {
-    parts.push(
-      "### Also in the fix brief",
-      "",
-      "_These findings cleared the fix-brief bar (typically medium severity) but not the inline gate (critical/high). They are written into `fix-brief.md` for an AI assistant to verify and fix, and are listed here so you can see them without opening every file. They are not posted as inline review threads. Download the brief from the link at the bottom of this review._",
-      "",
-      ...alsoInBrief.map(summaryFindingBullet),
       "",
     );
   }
@@ -651,28 +771,33 @@ export function hasMultiRunAgreement(finding: Finding): boolean {
 }
 
 /**
- * Whether a scored finding is eligible for an inline GitHub review comment.
- * Calibrated against beatbax: only critical/high above the confidence floor post inline;
- * medium findings that clear the fix-brief floor are summarised in the overview instead,
- * and low/info stay in the job summary (or findings.json when debug-artifacts is on).
- * Agreement across consistency runs adjusts the confidence score; it does not hide
- * critical/high findings that already clear the floor (one-off highs still publish).
- * `requireMultiRun` is accepted for call-site compatibility and is unused here.
+ * Whether a scored finding is eligible for a GitHub review thread.
+ * That is the fix-brief set: critical/high at or above `minimumConfidence`, and medium
+ * findings at or above the fix-brief floor. Low/info stay in the job summary.
+ * One-off medium findings stay out when `requireMultiRun` is set. One-off critical/high
+ * findings that already clear the floor still publish.
  */
 export function qualifiesForInline(
-  finding: Finding, minimumConfidence: number, _requireMultiRun = false,
+  finding: Finding,
+  minimumConfidence: number,
+  requireMultiRun = false,
+  fixBriefMediumConfidence = FIX_BRIEF_MEDIUM_CONFIDENCE,
 ): boolean {
-  if (finding.confidence < minimumConfidence) return false;
-  if (finding.severity !== "critical" && finding.severity !== "high") return false;
-  return true;
+  return qualifiesForFixBrief(finding, minimumConfidence, fixBriefMediumConfidence, requireMultiRun);
 }
 
-/** Split anchored findings into inline comments, below-threshold leftovers, and cap overflow. */
+/** Split anchored findings into review threads, below-threshold leftovers, and cap overflow. */
 export function partitionInline(
-  anchored: Finding[], minimumConfidence: number, maxComments: number, requireMultiRun = false,
+  anchored: Finding[],
+  minimumConfidence: number,
+  maxComments: number,
+  requireMultiRun = false,
+  fixBriefMediumConfidence = FIX_BRIEF_MEDIUM_CONFIDENCE,
 ): { inline: Finding[]; belowConfidence: Finding[]; capped: Finding[] } {
-  const belowConfidence = anchored.filter((finding) => !qualifiesForInline(finding, minimumConfidence, requireMultiRun));
-  const ordered = rankFindings(anchored.filter((finding) => qualifiesForInline(finding, minimumConfidence, requireMultiRun)));
+  const qualify = (finding: Finding) =>
+    qualifiesForInline(finding, minimumConfidence, requireMultiRun, fixBriefMediumConfidence);
+  const belowConfidence = anchored.filter((finding) => !qualify(finding));
+  const ordered = distinctThreadFindings(rankFindings(anchored.filter(qualify)));
   return {
     inline: maxComments > 0 ? ordered.slice(0, maxComments) : ordered,
     belowConfidence,
@@ -680,19 +805,46 @@ export function partitionInline(
   };
 }
 
-/** Findings that clear the publish gate: inline threads plus gated overview sections. */
+/** Findings that clear the thread gate: line comments, file comments, checklist entries, and cap overflow. */
 export function publishableFindings(
   anchored: Finding[],
   unanchored: Finding[],
   minimumConfidence: number,
   maxComments: number,
   requireMultiRun = false,
-): { inline: Finding[]; unanchored: Finding[]; capped: Finding[]; all: Finding[] } {
-  const { inline, capped } = partitionInline(anchored, minimumConfidence, maxComments, requireMultiRun);
-  const gatedUnanchored = rankFindings(
-    unanchored.filter((finding) => qualifiesForInline(finding, minimumConfidence, requireMultiRun)),
-  );
-  return { inline, unanchored: gatedUnanchored, capped, all: [...inline, ...gatedUnanchored, ...capped] };
+  fileLevel: Finding[] = [],
+  fixBriefMediumConfidence = FIX_BRIEF_MEDIUM_CONFIDENCE,
+): { inline: Finding[]; fileLevel: Finding[]; unanchored: Finding[]; capped: Finding[]; all: Finding[] } {
+  const qualify = (finding: Finding) =>
+    qualifiesForFixBrief(finding, minimumConfidence, fixBriefMediumConfidence, requireMultiRun);
+  const fileSet = new Set(fileLevel);
+  const unanchoredSet = new Set(unanchored);
+  const qualified = distinctThreadFindings(rankFindings(
+    [...anchored, ...fileLevel, ...unanchored].filter(qualify),
+  ));
+  const threadable = qualified.filter((finding) => !unanchoredSet.has(finding));
+  const threads = maxComments > 0 ? threadable.slice(0, maxComments) : threadable;
+  const capped = maxComments > 0 ? threadable.slice(maxComments) : [];
+  const gatedUnanchored = qualified.filter((finding) => unanchoredSet.has(finding));
+  const inline = threads.filter((finding) => !fileSet.has(finding));
+  const files = threads.filter((finding) => fileSet.has(finding));
+  return {
+    inline, fileLevel: files, unanchored: gatedUnanchored, capped,
+    all: [...threads, ...gatedUnanchored, ...capped],
+  };
+}
+
+/** Keep the higher-ranked finding when the same file, title, and line appear twice. */
+export function distinctThreadFindings(findings: Finding[]): Finding[] {
+  const seenAt = new Set<string>();
+  const kept: Finding[] = [];
+  for (const finding of findings) {
+    const at = `${threadKeyPath(finding.file)}\0${normalizeThreadTitle(finding.title)}\0${finding.line}`;
+    if (seenAt.has(at)) continue;
+    seenAt.add(at);
+    kept.push(finding);
+  }
+  return kept;
 }
 
 /** Default confidence floor for medium findings in the fix brief (PR gate stays stricter). */
@@ -711,7 +863,9 @@ export function qualifiesForFixBrief(
   fixBriefMediumConfidence = FIX_BRIEF_MEDIUM_CONFIDENCE,
   requireMultiRun = false,
 ): boolean {
-  if (qualifiesForInline(finding, minimumConfidence)) return true;
+  if ((finding.severity === "critical" || finding.severity === "high") && finding.confidence >= minimumConfidence) {
+    return true;
+  }
   if (finding.severity !== "medium") return false;
   if (requireMultiRun && !hasMultiRunAgreement(finding)) return false;
   return finding.confidence >= fixBriefMediumConfidence;
@@ -738,28 +892,311 @@ export function githubReviewPayload(
   requireMultiRun = false,
   overview: Pick<OverviewSections, "title" | "body" | "files"> = {},
   fixBriefMediumConfidence = FIX_BRIEF_MEDIUM_CONFIDENCE,
+  fileLevel: Finding[] = [],
 ): GitHubReviewPayload {
-  const published = publishableFindings(anchored, unanchored, minimumConfidence, maxComments, requireMultiRun);
-  const publishedKeys = new Set(published.all.map(findingFingerprint));
-  const alsoInBrief = fixBriefFindings(
-    [...anchored, ...unanchored], minimumConfidence, fixBriefMediumConfidence, requireMultiRun,
-  ).filter((finding) => !publishedKeys.has(findingFingerprint(finding)));
-  const belowGateCount = Math.max(
-    0, anchored.length + unanchored.length - published.all.length - alsoInBrief.length,
+  const published = publishableFindings(
+    anchored, unanchored, minimumConfidence, maxComments, requireMultiRun, fileLevel, fixBriefMediumConfidence,
   );
+  const belowGateCount = rankFindings([...anchored, ...fileLevel, ...unanchored]).filter((finding) =>
+    !qualifiesForFixBrief(finding, minimumConfidence, fixBriefMediumConfidence, requireMultiRun)).length;
   return {
     event: "COMMENT",
     body: reviewOverviewBody(published.inline, minimumConfidence, {
       unanchored: published.unanchored,
       capped: published.capped,
-      alsoInBrief,
+      fileLevel: published.fileLevel,
       belowGateCount,
       title: overview.title,
       body: overview.body,
       files: overview.files,
     }),
     comments: published.inline.map((finding) => toReviewComment(finding, render(finding))),
+    fileComments: published.fileLevel.map((finding) =>
+      toFileComment(finding, render({ ...finding, suggestion: undefined }))),
+    checklist: [...published.unanchored, ...published.capped].map(checklistItemFromFinding),
   };
+}
+
+function checklistLocation(item: ChecklistItem): string {
+  const range = item.endLine !== undefined && item.endLine > item.line
+    ? `${item.line}-${item.endLine}` : `${item.line}`;
+  return `${item.file}:${range}`;
+}
+
+/** One checklist entry. The hidden item marker is how a later run appends without wiping agent notes. */
+export function renderChecklistItem(item: ChecklistItem): string {
+  const lines = [
+    `#### ${item.severity}: ${item.title}`,
+    "",
+    `\`${checklistLocation(item)}\``,
+    "",
+    item.description.trim(),
+  ];
+  if (item.recommendation?.trim()) lines.push("", `**Fix:** ${item.recommendation.trim()}`);
+  lines.push(
+    "",
+    "<what you fixed, or why you skipped this finding>",
+    "",
+    checklistItemMarker(item.fingerprint),
+  );
+  return lines.join("\n");
+}
+
+export function renderChecklistBody(items: ChecklistItem[]): string {
+  return [
+    "### FixBrief findings without a review thread",
+    "",
+    "These findings could not be attached to a changed line. Edit this comment to say what you fixed, or why you skipped each one. Do not open a new pull request comment.",
+    "",
+    CHECKLIST_MARKER,
+    "",
+    items.map(renderChecklistItem).join("\n\n"),
+    "",
+  ].join("\n");
+}
+
+export interface LocationRef {
+  id: string;
+  /** File and title identity. Line shifts stay in the same group. */
+  base: string;
+  line?: number;
+}
+
+/**
+ * A single finding is reused only when it stays in this neighborhood.
+ * A wider gap is a different finding unless several same-title findings move
+ * by the same amount, which is evidence that one edit shifted them together.
+ * The boundary is locked by the "thread reuse policy" test.
+ */
+export const LONE_LINE_SHIFT = 15;
+
+interface ShiftMatch<T, U> {
+  pairs: Array<[T, U]>;
+  cost: number;
+}
+
+function byLine<T extends LocationRef>(items: T[]): T[] {
+  return items
+    .filter((item) => item.line !== undefined)
+    .sort((a, b) => (a.line as number) - (b.line as number) || a.id.localeCompare(b.id));
+}
+
+/** Same-title findings that all moved by one offset. One pair is not evidence. */
+function uniformShift<T extends LocationRef, U extends LocationRef>(left: T[], right: U[]): ShiftMatch<T, U> | null {
+  let best: ShiftMatch<T, U> | null = null;
+  const deltas = new Set<number>();
+  for (const claim of left) {
+    for (const prior of right) deltas.add((claim.line as number) - (prior.line as number));
+  }
+  for (const delta of deltas) {
+    const pairs: Array<[T, U]> = [];
+    let j = 0;
+    for (const claim of left) {
+      const target = (claim.line as number) - delta;
+      while (j < right.length && (right[j].line as number) < target) j++;
+      if (j < right.length && right[j].line === target) {
+        pairs.push([claim, right[j]]);
+        j++;
+      }
+    }
+    if (pairs.length < 2) continue;
+    const cost = pairs.length * Math.abs(delta);
+    if (!best || pairs.length > best.pairs.length || (pairs.length === best.pairs.length && cost < best.cost)) {
+      best = { pairs, cost };
+    }
+  }
+  return best;
+}
+
+/**
+ * Non-crossing pairs inside {@link LONE_LINE_SHIFT}. More pairs win over a
+ * shorter jump, so a finding that lands on a neighbor's old line does not take it.
+ */
+function localShift<T extends LocationRef, U extends LocationRef>(left: T[], right: U[]): ShiftMatch<T, U> {
+  const n = left.length;
+  const m = right.length;
+  const count: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  const cost: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  const choice: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      let bestCount = count[i - 1][j];
+      let bestCost = cost[i - 1][j];
+      let how = 0;
+      if (count[i][j - 1] > bestCount || (count[i][j - 1] === bestCount && cost[i][j - 1] < bestCost)) {
+        bestCount = count[i][j - 1];
+        bestCost = cost[i][j - 1];
+        how = 1;
+      }
+      const delta = Math.abs((left[i - 1].line as number) - (right[j - 1].line as number));
+      if (delta <= LONE_LINE_SHIFT) {
+        const pairCount = count[i - 1][j - 1] + 1;
+        const pairCost = cost[i - 1][j - 1] + delta;
+        if (pairCount > bestCount || (pairCount === bestCount && pairCost < bestCost)) {
+          bestCount = pairCount;
+          bestCost = pairCost;
+          how = 2;
+        }
+      }
+      count[i][j] = bestCount;
+      cost[i][j] = bestCost;
+      choice[i][j] = how;
+    }
+  }
+  const pairs: Array<[T, U]> = [];
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    if (choice[i][j] === 2) {
+      pairs.push([left[i - 1], right[j - 1]]);
+      i--;
+      j--;
+    } else if (choice[i][j] === 1) j--;
+    else i--;
+  }
+  pairs.reverse();
+  return { pairs, cost: cost[n][m] };
+}
+
+function chooseShift<T, U>(uniform: ShiftMatch<T, U> | null, local: ShiftMatch<T, U>): Array<[T, U]> {
+  if (uniform && (uniform.pairs.length > local.pairs.length || (uniform.pairs.length === local.pairs.length && uniform.cost < local.cost))) {
+    return uniform.pairs;
+  }
+  return local.pairs;
+}
+
+/**
+ * Pair items that share a file and title. Each side is used once, in line order.
+ * A lone far jump is left unmatched. Several findings that share one offset stay
+ * with their own entries, including when one of them lands on another's old line.
+ * Accepted outcomes are the "thread reuse policy" test.
+ */
+export function matchByLocation<T extends LocationRef, U extends LocationRef>(current: T[], existing: U[]): Map<string, U> {
+  const result = new Map<string, U>();
+  const groups = new Map<string, { current: T[]; existing: U[] }>();
+  for (const item of current) {
+    const group = groups.get(item.base) ?? { current: [], existing: [] };
+    group.current.push(item);
+    groups.set(item.base, group);
+  }
+  for (const item of existing) {
+    const group = groups.get(item.base);
+    if (group) group.existing.push(item);
+  }
+  for (const group of groups.values()) {
+    const left = byLine(group.current);
+    const right = byLine(group.existing);
+    if (!left.length || !right.length) continue;
+    for (const [claim, prior] of chooseShift(uniformShift(left, right), localShift(left, right))) {
+      result.set(claim.id, prior);
+    }
+  }
+  return result;
+}
+
+interface ParsedChecklistEntry {
+  fingerprint: string;
+  file: string;
+  line: number;
+  title: string;
+}
+
+function parseChecklistEntries(body: string): ParsedChecklistEntry[] {
+  const entries: ParsedChecklistEntry[] = [];
+  const re = /####\s+\w+:\s+(.+)\n+\s*`([^`\n]+):(\d+)(?:-\d+)?`[\s\S]*?<!--\s*fixbrief-ai-item:([^\s>]+)\s*-->/g;
+  for (const match of body.matchAll(re)) {
+    entries.push({ title: match[1].trim(), file: match[2], line: Number(match[3]), fingerprint: match[4] });
+  }
+  return entries;
+}
+
+/** Checklist items that are not already in the comment, even if a line shift changed their fingerprint. */
+export function checklistItemsToAppend(existing: string | undefined, items: ChecklistItem[]): ChecklistItem[] {
+  if (!existing?.includes(CHECKLIST_MARKER)) return items;
+  const entries = parseChecklistEntries(existing);
+  const used = new Set<string>();
+  const pending: ChecklistItem[] = [];
+  for (const item of items) {
+    const exact = entries.find((entry) => entry.fingerprint === item.fingerprint && !used.has(entry.fingerprint));
+    if (exact) { used.add(exact.fingerprint); continue; }
+    pending.push(item);
+  }
+  const pairs = matchByLocation(
+    pending.map((item) => ({ id: item.fingerprint, base: threadBaseFingerprint(item), line: item.line })),
+    entries.filter((entry) => !used.has(entry.fingerprint)).map((entry) => ({
+      id: entry.fingerprint,
+      base: threadBaseFingerprint({ file: entry.file, title: entry.title }),
+      line: entry.line,
+    })),
+  );
+  return pending.filter((item) => !pairs.has(item.fingerprint));
+}
+
+/** Append findings that are not already in the comment. Existing text, including agent notes, is kept. */
+export function mergeChecklistBody(existing: string | undefined, items: ChecklistItem[]): string {
+  if (!existing?.includes(CHECKLIST_MARKER)) return renderChecklistBody(items);
+  const missing = checklistItemsToAppend(existing, items);
+  if (!missing.length) return `${existing.trimEnd()}\n`;
+  return `${existing.trimEnd()}\n\n${missing.map(renderChecklistItem).join("\n\n")}\n`;
+}
+
+/**
+ * Source of the checklist update used by the report-back command.
+ * `current`, `edited`, and `original` are in scope; the result is `next`.
+ */
+export const CHECKLIST_MERGE_SOURCE = `
+const re = /<!--\\s*fixbrief-ai-item:([^\\s>]+)\\s*-->/g;
+const blocks = (body) => {
+  const marks = [...body.matchAll(re)].map((match) => ({
+    fp: match[1],
+    end: match.index + match[0].length,
+  }));
+  return marks.map((mark, index) => {
+    const prev = index === 0 ? body.indexOf("<!-- fixbrief-ai-checklist -->") : marks[index - 1].end;
+    let from = body.indexOf("\\n#### ", prev < 0 ? 0 : prev);
+    if (from < 0) from = prev < 0 ? 0 : prev;
+    else from += 1;
+    return { fp: mark.fp, from, to: mark.end, text: body.slice(from, mark.end).trim() };
+  });
+};
+const unchanged = new Map(blocks(original).map((item) => [item.fp, item.text]));
+const incoming = blocks(edited).filter((item) => unchanged.get(item.fp) !== item.text);
+let next = current;
+const live = blocks(next);
+const rows = [];
+for (const item of incoming) {
+  const found = live.find((row) => row.fp === item.fp);
+  if (found) rows.push({ item, found });
+}
+rows.sort((a, b) => b.found.from - a.found.from);
+for (const row of rows) {
+  next = next.slice(0, row.found.from) + row.item.text + next.slice(row.found.to);
+}
+const have = new Set(blocks(next).map((row) => row.fp));
+for (const item of incoming) {
+  if (!have.has(item.fp)) next = next.trimEnd() + "\\n\\n" + item.text + "\\n";
+}
+if (!next.endsWith("\\n")) next += "\\n";
+`.trim();
+
+/** Apply checklist items the agent changed. Items still equal to `original` stay as they are on the live comment. */
+export function mergeChecklistReport(current: string, edited: string, original = ""): string {
+  const run = new Function("current", "edited", "original", `${CHECKLIST_MERGE_SOURCE}\nreturn next;`) as (
+    current: string, edited: string, original: string,
+  ) => string;
+  return run(current, edited, original);
+}
+
+export function checklistCovers(existing: string | undefined, items: ChecklistItem[]): boolean {
+  if (!items.length) return true;
+  if (!existing?.includes(CHECKLIST_MARKER)) return false;
+  return checklistItemsToAppend(existing, items).length === 0;
+}
+
+/** Replace the overview's "generated N comments" count after threads are dropped as duplicates. */
+export function rewriteGeneratedCommentCount(body: string, count: number): string {
+  const word = `comment${count === 1 ? "" : "s"}`;
+  return body.replace(/generated \d+ comments?/, `generated ${count} ${word}`);
 }
 
 /** Targets written beside fix-brief.md so a later step can attach reply commands. */
@@ -770,7 +1207,11 @@ export interface FixBriefTarget {
   line: number;
   endLine?: number;
   title: string;
-  /** True when the finding was posted as an inline review comment. */
+  /** Stable across runs. Built from the file, title, and line. */
+  fingerprint: string;
+  /** `thread` replies on a review comment. `checklist` updates the single checklist comment. */
+  placement: "thread" | "checklist";
+  /** True when the finding was posted as a review thread (line or file comment). */
   inline: boolean;
 }
 
@@ -791,15 +1232,20 @@ export function buildFixBriefTargets(
     schemaVersion: 1,
     repo,
     pr,
-    targets: findings.map((finding) => ({
-      id: finding.id,
-      severity: finding.severity,
-      file: finding.file,
-      line: finding.line,
-      endLine: finding.endLine,
-      title: finding.title,
-      inline: inlineIds.has(finding.id),
-    })),
+    targets: findings.map((finding) => {
+      const inline = inlineIds.has(finding.id);
+      return {
+        id: finding.id,
+        severity: finding.severity,
+        file: finding.file,
+        line: finding.line,
+        endLine: finding.endLine,
+        title: finding.title,
+        fingerprint: threadFingerprint(finding),
+        placement: inline ? "thread" as const : "checklist" as const,
+        inline,
+      };
+    }),
   };
 }
 

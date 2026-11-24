@@ -39,24 +39,36 @@ test("matchCommentIds accepts legacy reviewbrief markers", () => {
   assert.equal(matched.get("RB1"), 2001);
 });
 
-test("reportBackItem uses thread reply when a comment id is known", () => {
+test("reportBackItem replies once on a thread and does not invent a pull request comment", () => {
   const withId = reportBackItem(targets.targets[0], 1001, "owner/name", "42");
+  assert.match(withId.command, /in_reply_to_id == 1001/);
+  assert.match(withId.command, /--paginate --slurp/);
+  assert.match(withId.command, /could not read replies for review comment 1001; not posting/);
   assert.match(withId.command, /\/comments\/1001\/replies/);
   assert.match(withId.command, /Null check/);
+  assert.match(withId.command, /already reported on review comment 1001/);
+  assert.match(withId.command, /fixbrief-ai-report:/);
+  assert.ok(withId.command.indexOf("not posting") < withId.command.indexOf("/comments/1001/replies"));
   const without = reportBackItem(targets.targets[1], undefined, "owner/name", "42");
-  assert.match(without.command, /gh pr comment 42 --repo owner\/name/);
-  assert.match(without.command, /Edge case/);
+  assert.equal(without.command, "");
 });
 
-test("renderReportBackSection lists reply commands for matched and unmatched findings", () => {
+test("renderReportBackSection replies on threads and updates one checklist comment", () => {
   const section = renderReportBackSection(targets, [
     { id: 1001, body: `body ${findingMarker("RB1")}` },
-  ]);
+  ], { id: 77, body: "### FixBrief findings without a review thread\n\nEdge case\n" });
   assert.match(section, /## Report back/);
   assert.match(section, /reply on review comment `1001`/);
   assert.match(section, /\/comments\/1001\/replies/);
-  assert.match(section, /no inline thread/);
-  assert.match(section, /gh pr comment 42/);
+  assert.match(section, /Do not open any other pull request comment/);
+  assert.match(section, /issues\/comments\/77/);
+  assert.match(section, /could not read checklist comment 77; not updating/);
+  assert.ok(section.indexOf("issues/comments/77\" --jq .body") < section.indexOf("method PATCH"));
+  assert.equal(section.split("gh pr comment").length, 1);
+  const unmatched = renderReportBackSection(targets, []);
+  assert.match(unmatched, /no review thread was posted/);
+  assert.match(unmatched, /gh pr comment 42/);
+  assert.equal(unmatched.split("gh pr comment").length, 2);
 });
 
 test("attachReportBack appends and replaces the Report back section", () => {
@@ -118,7 +130,7 @@ test("appendBriefDownloadLink adds usage instructions and does not duplicate", (
   assert.match(block, /coding assistant/);
   const once = appendBriefDownloadLink("## Pull request overview\n\nHello.\n", url);
   assert.match(once, /Download `fix-brief\.md`/);
-  assert.match(once, /comment back on this pull request/);
+  assert.match(once, /reply on the review thread/);
   const twice = appendBriefDownloadLink(once, url);
   assert.equal(twice, once);
   assert.equal(twice.split("download fix-brief.md").length, 2);

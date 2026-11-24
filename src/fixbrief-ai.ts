@@ -8,7 +8,8 @@ import { annotateDiff, anchorFindings, parseDiffLines } from "./difflines.ts";
 import {
   FIX_BRIEF_MEDIUM_CONFIDENCE, buildFixBriefTargets, categoriesLabel, filterByCategories,
   fixBriefFindings, formatFileListFooter, githubReviewPayload, parseCategories, parseResponse,
-  parseSkippedEntry, partitionInline, qualifiesForFixBrief, rankFindings, renderFinding, repairFindingsPrompt,
+  parseSkippedEntry, publishableFindings, qualifiesForFixBrief, rankFindings, renderFinding, repairFindingsPrompt,
+  distinctThreadFindings,
   type CategoryFilter, type Finding, type OverviewFile,
 } from "./findings.ts";
 import { clusterRuns, scoreFinding } from "./confidence.ts";
@@ -394,7 +395,7 @@ async function makeFixBrief(config: LlmConfig, ctx: Context, final: string): Pro
       "2. For each finding, open the referenced file and **verify the problem is real** before changing anything. If it is not real, or you cannot tell, skip it and explain why.",
       "3. Make the smallest change that fixes each verified problem. Do not refactor, reformat, or touch unrelated code.",
       "4. Run the project's existing tests and linters after your changes, and fix anything you broke.",
-      "5. For **every** finding, leave a short comment on the pull request describing what you changed, or why you skipped it. Use the commands in the **Report back** section at the end of this file (reply on the matching review thread when a comment id is listed; otherwise post a new PR comment). Do not stop at a chat-only summary.",
+      "5. For **every** finding, report what you changed, or why you skipped it, using only the commands in the **Report back** section at the end of this file. Reply on the matching review thread when a comment id is listed. When a checklist comment is listed, update that one comment. Do not open any other pull request comment. Do not stop at a chat-only summary.",
       "", "## Findings", "",
     ];
     console.log("Fix brief generated.");
@@ -636,14 +637,16 @@ async function main(): Promise<number> {
   }
   const active = reviewed.filter((finding) => !isDropped(finding));
   const final = active.length ? rankFindings(active).map(safeRender).join("\n\n") : nothingFound;
-  const { anchored, unanchored } = anchorFindings(active, lineMap);
-  const { inline: inlineFindings } = partitionInline(
-    anchored, minimumConfidence, maxInlineComments, requireMultiRun,
+  const { anchored, fileLevel, unanchored } = anchorFindings(active, lineMap);
+  const published = publishableFindings(
+    anchored, unanchored, minimumConfidence, maxInlineComments, requireMultiRun,
+    fileLevel, fixBriefMediumConfidence,
   );
+  const inlineFindings = [...published.inline, ...published.fileLevel];
   const files = overviewFiles(pieces, skipped, unreviewed, inlineFindings);
   const payload = githubReviewPayload(
     anchored, minimumConfidence, maxInlineComments, safeRender, unanchored, requireMultiRun,
-    { title: ctx.title, body: ctx.body, files }, fixBriefMediumConfidence,
+    { title: ctx.title, body: ctx.body, files }, fixBriefMediumConfidence, fileLevel,
   );
   const reviewScope = env("REVIEW_SCOPE");
   const footer = [`_Reviewed ${pieces.length} diff pieces in ${batches.length} API call(s) with \`${model}\` (${provider})._`];
@@ -678,10 +681,15 @@ async function main(): Promise<number> {
   const inlineKeys = new Set(inlineFindings.map(keyOf));
   const inlineIds = new Set(inlineFindings.map((finding) => finding.id));
   const droppedAnchor = anchorFindings(reviewed.filter(isDropped), lineMap);
+  const placed = (finding: Finding, onDiff: boolean) => ({
+    ...finding, anchored: onDiff, inline: inlineKeys.has(keyOf(finding)),
+  });
   const records = [
-    ...anchored.map((s) => ({ ...s, anchored: true, inline: inlineKeys.has(keyOf(s)) })),
-    ...unanchored.map((s) => ({ ...s, anchored: false, inline: false })),
+    ...anchored.map((s) => placed(s, true)),
+    ...fileLevel.map((s) => placed(s, false)),
+    ...unanchored.map((s) => placed(s, false)),
     ...droppedAnchor.anchored.map((s) => ({ ...s, anchored: true, inline: false })),
+    ...droppedAnchor.fileLevel.map((s) => ({ ...s, anchored: false, inline: false })),
     ...droppedAnchor.unanchored.map((s) => ({ ...s, anchored: false, inline: false })),
   ].sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line || a.title.localeCompare(b.title));
   writeFileSync(join(args.outDir, "findings.json"), JSON.stringify({
@@ -699,9 +707,9 @@ async function main(): Promise<number> {
   const targetsPath = join(args.outDir, "fix-brief-targets.json");
   if (existsSync(targetsPath)) rmSync(targetsPath);
   if (env("FIX_BRIEF", "true").toLowerCase() === "true" && !flags.has("--no-fix-brief")) {
-    const forBriefFindings = fixBriefFindings(
-      [...anchored, ...unanchored], minimumConfidence, fixBriefMediumConfidence, requireMultiRun,
-    );
+    const forBriefFindings = distinctThreadFindings(fixBriefFindings(
+      [...anchored, ...fileLevel, ...unanchored], minimumConfidence, fixBriefMediumConfidence, requireMultiRun,
+    ));
     const forBrief = forBriefFindings.length
       ? forBriefFindings.map(safeRender).join("\n\n")
       : "NO_ACTIONABLE_FINDINGS";

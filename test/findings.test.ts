@@ -6,6 +6,7 @@ import {
   parseCategories, parseFindingMarker, parseResponse, parseSkippedEntry, partitionInline,
   payloadHasContent, publishableFindings, qualifiesForFixBrief, qualifiesForInline,
   rankFindings, renderFinding, repairFindingsPrompt, reviewOverviewBody,
+  checklistItemFromFinding, matchByLocation, mergeChecklistBody, mergeChecklistReport, renderChecklistBody, threadFingerprint,
 } from "../src/findings.ts";
 import { reviewSystemPrompt } from "../src/fixbrief-ai.ts";
 
@@ -138,7 +139,7 @@ test("renderFinding omits a large suggestion instead of crushing the description
 test("review overview body uses Copilot-style sections; below-gate stay off the PR", () => {
   const empty = reviewOverviewBody([], 0.85);
   assert.match(empty, /## FixBrief AI review/);
-  assert.match(empty, /No inline findings met the publish gate/);
+  assert.match(empty, /No findings met the thread gate/);
   assert.doesNotMatch(empty, /Also noted/);
   const emptyWithBelow = reviewOverviewBody([], 0.85, { belowGateCount: 3 });
   assert.match(emptyWithBelow, /3 other findings were scored but stayed below the publish gate \(see the workflow job summary\)/);
@@ -172,7 +173,7 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
   assert.doesNotMatch(body, /`quiet\.ts`/);
   assert.doesNotMatch(body, /\| Severity \| Count \|/);
   assert.doesNotMatch(body, /confidence ≥/);
-  assert.match(body, /### Could not place inline/);
+  assert.match(body, /### Could not place on a changed file/);
   assert.match(body, /\*\*Unanchored high\*\*/);
   assert.match(body, /Cannot attach this line\./);
   assert.match(body, /\*\*Recommendation:\*\* Move the change onto an added line\./);
@@ -198,45 +199,47 @@ test("review overview body uses Copilot-style sections; below-gate stay off the 
     files: [{ path: "a.py", reviewed: true, comments: 1 }],
   });
   assert.match(payload.body, /## FixBrief AI review/);
-  assert.match(payload.body, /generated 1 comment, plus 2 more findings summarised below and included in the fix brief/);
+  assert.match(payload.body, /generated 2 comments/);
   assert.doesNotMatch(payload.body, /\*\*Keep\*\*/);
   assert.doesNotMatch(payload.body, /Also noted/);
   assert.doesNotMatch(payload.body, /\*\*Drop\*\*/);
   assert.doesNotMatch(payload.body, /\*\*Low severity drop\*\*/);
-  assert.match(payload.body, /### Also in the fix brief/);
-  assert.match(payload.body, /cleared the fix-brief bar/);
-  assert.match(payload.body, /not the inline gate/);
-  assert.match(payload.body, /\*\*Medium never inline\*\*/);
+  assert.doesNotMatch(payload.body, /### Also in the fix brief/);
+  assert.doesNotMatch(payload.body, /\*\*Medium never inline\*\*/);
   assert.match(payload.body, /\*\*Unanchored medium\*\*/);
-  assert.match(payload.body, /### Could not place inline/);
+  assert.match(payload.body, /### Could not place on a changed file/);
   assert.match(payload.body, /\*\*Unanchored high\*\*/);
   assert.match(payload.body, /\*\*Recommendation:\*\* fix it/);
-  assert.equal(payload.comments.length, 1);
-  assert.match(payload.comments[0].body, /<div align="right"><b>High<\/b><\/div>/);
+  assert.equal(payload.comments.length, 2);
+  assert.equal(payload.checklist.length, 2);
+  assert.match(payload.comments.map((comment) => comment.body).join("\n"), /<div align="right"><b>High<\/b><\/div>/);
+  assert.match(payload.comments.map((comment) => comment.body).join("\n"), /fixbrief-ai-fp:/);
   assert.doesNotMatch(payload.comments[0].body, /% confidence/);
   const capped = githubReviewPayload([
     sig({ confidence: 0.95, title: "First", line: 2 }),
     sig({ confidence: 0.9, title: "Second", line: 3, description: "Over cap.", recommendation: "Raise the cap." }),
   ] as any, 0.85, 1);
   assert.equal(capped.comments.length, 1);
+  assert.equal(capped.checklist.length, 1);
+  assert.equal(capped.checklist[0].title, "Second");
   assert.match(capped.body, /### Over the inline cap/);
   assert.match(capped.body, /\*\*Second\*\*/);
   assert.match(capped.body, /\*\*Recommendation:\*\* Raise the cap\./);
 });
 
-test("fix-brief medium findings appear in the overview; weaker findings stay off it", () => {
+test("fix-brief medium findings are review threads; weaker findings stay off the pull request", () => {
   const payload = githubReviewPayload([
     sig({ confidence: 0.9, title: "Inline high", line: 1 }),
     sig({ severity: "medium", confidence: 0.75, title: "Brief medium", line: 2, description: "Edge case.", recommendation: "Guard it." }),
     sig({ severity: "medium", confidence: 0.74, title: "Too weak medium", line: 3 }),
     sig({ severity: "low", confidence: 0.99, title: "Low stays off", line: 4 }),
   ] as any, 0.85);
-  assert.equal(payload.comments.length, 1);
-  assert.match(payload.body, /generated 1 comment, plus 1 more finding summarised below and included in the fix brief/);
-  assert.match(payload.body, /### Also in the fix brief/);
-  assert.match(payload.body, /\*\*Brief medium\*\*/);
-  assert.match(payload.body, /Edge case\./);
-  assert.match(payload.body, /\*\*Recommendation:\*\* Guard it\./);
+  assert.equal(payload.comments.length, 2);
+  assert.match(payload.body, /generated 2 comments/);
+  assert.doesNotMatch(payload.body, /### Also in the fix brief/);
+  assert.doesNotMatch(payload.body, /\*\*Brief medium\*\*/);
+  assert.match(payload.comments.map((comment) => comment.body).join("\n"), /\*\*Brief medium\*\*/);
+  assert.match(payload.comments.map((comment) => comment.body).join("\n"), /Edge case\./);
   assert.doesNotMatch(payload.body, /\*\*Too weak medium\*\*/);
   assert.doesNotMatch(payload.body, /\*\*Low stays off\*\*/);
   assert.doesNotMatch(payload.body, /\*\*Inline high\*\*/);
@@ -245,9 +248,8 @@ test("fix-brief medium findings appear in the overview; weaker findings stay off
   const briefOnly = githubReviewPayload([
     sig({ severity: "medium", confidence: 0.8, title: "Only in brief", line: 5, description: "Worth noting." }),
   ] as any, 0.85);
-  assert.equal(briefOnly.comments.length, 0);
-  assert.match(briefOnly.body, /### Also in the fix brief/);
-  assert.match(briefOnly.body, /\*\*Only in brief\*\*/);
+  assert.equal(briefOnly.comments.length, 1);
+  assert.match(briefOnly.comments[0].body, /\*\*Only in brief\*\*/);
   assert.equal(payloadHasContent(briefOnly), true);
 });
 
@@ -324,12 +326,13 @@ test("rankFindings/partitionInline: highest-confidence duplicate wins, threshold
   assert.deepEqual(rankFindings([b, a] as any).map((s) => s.category), ["quality", "security"]);
 });
 
-test("qualifiesForInline: only critical/high above confidence floor; medium/low/info never inline", () => {
+test("qualifiesForInline: fix-brief findings are threads; low/info and weak mediums are not", () => {
   const mk = (o: any) => ({ id: "S", category: "quality", severity: "high", confidence: 0.85, file: "a.py", line: 1, title: "t", description: "d", ...o });
   assert.equal(qualifiesForInline(mk({}) as any, 0.85), true);
   assert.equal(qualifiesForInline(mk({ severity: "critical", confidence: 0.85 }) as any, 0.85), true);
   assert.equal(qualifiesForInline(mk({ severity: "high", confidence: 0.84 }) as any, 0.85), false);
-  assert.equal(qualifiesForInline(mk({ severity: "medium", confidence: 0.99 }) as any, 0.85), false);
+  assert.equal(qualifiesForInline(mk({ severity: "medium", confidence: 0.75, title: "med" }) as any, 0.85), true);
+  assert.equal(qualifiesForInline(mk({ severity: "medium", confidence: 0.74, title: "weak" }) as any, 0.85), false);
   assert.equal(qualifiesForInline(mk({ severity: "low", confidence: 0.99 }) as any, 0.85), false);
   assert.equal(qualifiesForInline(mk({ severity: "info", confidence: 0.99 }) as any, 0.85), false);
   const gated = partitionInline([
@@ -338,8 +341,8 @@ test("qualifiesForInline: only critical/high above confidence floor; medium/low/
     mk({ line: 3, severity: "medium", confidence: 0.99, title: "m-hi" }),
     mk({ line: 4, severity: "low", confidence: 0.99, title: "low" }),
   ] as any, 0.85, 0);
-  assert.deepEqual(gated.inline.map((s) => s.line), [2, 1]);
-  assert.deepEqual(gated.belowConfidence.map((s) => s.line).sort((a, b) => a - b), [3, 4]);
+  assert.deepEqual(gated.inline.map((s) => s.line), [2, 1, 3]);
+  assert.deepEqual(gated.belowConfidence.map((s) => s.line), [4]);
 });
 
 test("fix brief includes PR-gated findings plus medium at ≥ 0.75; skips low/info", () => {
@@ -393,4 +396,178 @@ test("requireMultiRun: one-off high still publishes; one-off medium stays out of
   assert.deepEqual(published.inline.map((s) => s.title), ["agreed", "once"]);
   assert.deepEqual(fixBriefFindings([agreed, once, medOnce, medAgreed] as any, 0.85, 0.75, true).map((s) => s.title),
     ["agreed", "once", "med-agreed"]);
+});
+
+test("file-level findings become file comments; files outside the diff become checklist items", () => {
+  const payload = githubReviewPayload([], 0.85, Number.POSITIVE_INFINITY, undefined, [
+    sig({ file: "missing.py", line: 1, title: "Missing", confidence: 0.9, description: "not in diff", recommendation: "move it" }) as any,
+  ], false, {}, 0.75, [
+    sig({ file: "a.py", line: 99, title: "Off hunk", suggestion: "nope" }) as any,
+  ]);
+  assert.equal(payload.comments.length, 0);
+  assert.equal(payload.fileComments.length, 1);
+  assert.equal(payload.fileComments[0].subject_type, "file");
+  assert.equal(payload.fileComments[0].path, "a.py");
+  assert.doesNotMatch(payload.fileComments[0].body, /```suggestion/);
+  assert.match(payload.fileComments[0].body, /fixbrief-ai-fp:/);
+  assert.equal(payload.checklist.length, 1);
+  assert.equal(payload.checklist[0].title, "Missing");
+  assert.match(payload.body, /generated 1 comment/);
+});
+
+test("thread fingerprint includes the line, ignores a leading dot-slash, and keeps a/ and b/ directories", () => {
+  const left = threadFingerprint({ file: "./a.py", title: "Keep  Harmonics" });
+  const right = threadFingerprint({ file: "a.py", title: "keep harmonics" });
+  assert.equal(left, right);
+  assert.notEqual(left, threadFingerprint({ file: "a.py", line: 40, title: "keep harmonics" }));
+  assert.equal(
+    threadFingerprint({ file: "./a.py", line: 40, title: "Keep  Harmonics" }),
+    threadFingerprint({ file: "a.py", line: 40, title: "keep harmonics" }),
+  );
+  assert.notEqual(left, threadFingerprint({ file: "a.py", title: "other" }));
+  assert.notEqual(
+    threadFingerprint({ file: "a/config.ts", title: "Same" }),
+    threadFingerprint({ file: "b/config.ts", title: "Same" }),
+  );
+  assert.notEqual(
+    threadFingerprint({ file: "a/config.ts", title: "Same" }),
+    threadFingerprint({ file: "config.ts", title: "Same" }),
+  );
+});
+
+test("two findings with the same file and title at different lines both stay in the review", () => {
+  const payload = githubReviewPayload([
+    sig({ id: "A", line: 4, title: "Shared", confidence: 0.9 }),
+    sig({ id: "B", line: 12, title: "Shared", confidence: 0.86 }),
+    sig({ id: "C", line: 4, title: "Shared", confidence: 0.99 }),
+  ] as any, 0.85);
+  assert.equal(payload.comments.length, 2);
+  const fingerprints = payload.comments.map((comment) => comment.body.match(/fixbrief-ai-fp:([^\s>]+)/)?.[1]);
+  assert.equal(fingerprints[0], threadFingerprint({ file: "a.py", title: "Shared", line: 4 }));
+  assert.equal(fingerprints[1], threadFingerprint({ file: "a.py", title: "Shared", line: 12 }));
+  const reordered = githubReviewPayload([
+    sig({ id: "B", line: 12, title: "Shared", confidence: 0.99 }),
+    sig({ id: "C", line: 4, title: "Shared", confidence: 0.86 }),
+  ] as any, 0.85);
+  const again = reordered.comments.map((comment) => comment.body.match(/fixbrief-ai-fp:([^\s>]+)/)?.[1]);
+  assert.deepEqual(again, [
+    threadFingerprint({ file: "a.py", title: "Shared", line: 12 }),
+    threadFingerprint({ file: "a.py", title: "Shared", line: 4 }),
+  ]);
+  const onlyLater = githubReviewPayload([
+    sig({ id: "B", line: 12, title: "Shared", confidence: 0.9 }),
+  ] as any, 0.85);
+  assert.equal(
+    onlyLater.comments[0].body.match(/fixbrief-ai-fp:([^\s>]+)/)?.[1],
+    threadFingerprint({ file: "a.py", title: "Shared", line: 12 }),
+  );
+  assert.match(payload.comments.map((comment) => comment.body).join("\n"), /fixbrief-ai:C/);
+  assert.match(payload.comments.map((comment) => comment.body).join("\n"), /fixbrief-ai:B/);
+});
+
+test("an inline finding and an unanchored finding with the same title do not share a fingerprint", () => {
+  const payload = githubReviewPayload([
+    sig({ id: "IN", line: 4, title: "Shared" }),
+  ] as any, 0.85, Number.POSITIVE_INFINITY, undefined, [
+    sig({ id: "OUT", line: 20, title: "Shared" }),
+  ] as any);
+  assert.equal(payload.comments.length, 1);
+  assert.equal(payload.checklist.length, 1);
+  assert.notEqual(
+    payload.comments[0].body.match(/fixbrief-ai-fp:([^\s>]+)/)?.[1],
+    payload.checklist[0].fingerprint,
+  );
+  assert.equal(payload.checklist[0].fingerprint, threadFingerprint({ file: "a.py", title: "Shared", line: 20 }));
+});
+
+test("mergeChecklistBody appends new items and keeps text the agent already wrote", () => {
+  const first = checklistItemFromFinding(sig({ id: "RB1", title: "First", file: "a.py", line: 1 }) as any);
+  const second = checklistItemFromFinding(sig({ id: "RB2", title: "Second", file: "b.py", line: 2 }) as any);
+  const existing = mergeChecklistBody(undefined, [first]).replace(
+    "<what you fixed, or why you skipped this finding>",
+    "Fixed the first one.",
+  );
+  const merged = mergeChecklistBody(existing, [first, second]);
+  assert.match(merged, /Fixed the first one\./);
+  assert.match(merged, /#### high: Second/);
+  assert.equal(merged.split("fixbrief-ai-checklist").length, 2);
+  assert.equal(mergeChecklistBody(merged, [first, second]), `${merged.trimEnd()}\n`);
+});
+
+test("matchByLocation keeps order for a shared shift and leaves a far line unmatched", () => {
+  const far = matchByLocation(
+    [{ id: "new", base: "p", line: 500 }],
+    [{ id: "old", base: "p", line: 10 }],
+  );
+  assert.equal(far.size, 0);
+  const ordered = matchByLocation(
+    [{ id: "a", base: "p", line: 29 }, { id: "b", base: "p", line: 49 }],
+    [{ id: "t10", base: "p", line: 10 }, { id: "t30", base: "p", line: 30 }],
+  );
+  assert.equal(ordered.get("a")?.id, "t10");
+  assert.equal(ordered.get("b")?.id, "t30");
+  const crossed = matchByLocation(
+    [{ id: "a", base: "p", line: 12 }, { id: "b", base: "p", line: 14 }],
+    [{ id: "t10", base: "p", line: 10 }, { id: "t12", base: "p", line: 12 }],
+  );
+  assert.equal(crossed.get("a")?.id, "t10");
+  assert.equal(crossed.get("b")?.id, "t12");
+});
+
+test("a checklist item whose line moved reuses the existing entry", () => {
+  const original = checklistItemFromFinding(sig({ id: "RB1", title: "Moved", file: "a.py", line: 10 }) as any);
+  const existing = mergeChecklistBody(undefined, [original]).replace(
+    "<what you fixed, or why you skipped this finding>",
+    "Already reported.",
+  );
+  const shifted = checklistItemFromFinding(sig({ id: "RB2", title: "Moved", file: "a.py", line: 12 }) as any);
+  const other = checklistItemFromFinding(sig({ id: "RB3", title: "Other", file: "a.py", line: 40 }) as any);
+  const merged = mergeChecklistBody(existing, [shifted, other]);
+  assert.match(merged, /Already reported\./);
+  assert.equal(merged.split("fixbrief-ai-item:").length, 3);
+  assert.match(merged, /#### high: Other/);
+  assert.equal(mergeChecklistBody(merged, [shifted]), `${merged.trimEnd()}\n`);
+});
+
+test("a checklist item far from the existing one is appended", () => {
+  const original = checklistItemFromFinding(sig({ id: "RB1", title: "Moved", file: "a.py", line: 10 }) as any);
+  const existing = mergeChecklistBody(undefined, [original]).replace(
+    "<what you fixed, or why you skipped this finding>",
+    "Already reported.",
+  );
+  const distant = checklistItemFromFinding(sig({ id: "RB2", title: "Moved", file: "a.py", line: 500 }) as any);
+  const merged = mergeChecklistBody(existing, [distant]);
+  assert.match(merged, /Already reported\./);
+  assert.match(merged, /`a.py:500`/);
+  assert.equal(merged.split("fixbrief-ai-item:").length, 3);
+});
+
+test("mergeChecklistReport keeps the download link and later checklist edits", () => {
+  const first = checklistItemFromFinding(sig({ id: "RB1", title: "First", file: "a.py", line: 1 }) as any);
+  const later = checklistItemFromFinding(sig({ id: "RB9", title: "Later", file: "c.py", line: 3 }) as any);
+  const current = `${renderChecklistBody([first, later]).trimEnd()}\n\n**Fix brief:** [download fix-brief.md](https://example.com/brief)\n`;
+  const edited = renderChecklistBody([first]).replace(
+    "<what you fixed, or why you skipped this finding>",
+    "Fixed the first one.",
+  );
+  const merged = mergeChecklistReport(current, edited);
+  assert.match(merged, /Fixed the first one\./);
+  assert.match(merged, /#### high: Later/);
+  assert.match(merged, /download fix-brief\.md/);
+  assert.equal(merged.split("<what you fixed").length, 2);
+});
+
+test("mergeChecklistReport leaves an unedited item's live report in place", () => {
+  const first = checklistItemFromFinding(sig({ id: "RB1", title: "First", file: "a.py", line: 1 }) as any);
+  const later = checklistItemFromFinding(sig({ id: "RB9", title: "Later", file: "c.py", line: 3 }) as any);
+  const snapshot = renderChecklistBody([first, later]);
+  const placeholder = "<what you fixed, or why you skipped this finding>";
+  const at = snapshot.lastIndexOf(placeholder);
+  const live = `${snapshot.slice(0, at)}Reported by the other run.${snapshot.slice(at + placeholder.length).trimEnd()}\n\n**Fix brief:** [download fix-brief.md](https://example.com/brief)\n`;
+  const edited = snapshot.replace(placeholder, "Fixed the first one.");
+  const merged = mergeChecklistReport(live, edited, snapshot);
+  assert.match(merged, /Fixed the first one\./);
+  assert.match(merged, /Reported by the other run\./);
+  assert.match(merged, /download fix-brief\.md/);
+  assert.doesNotMatch(merged, /<what you fixed/);
 });
